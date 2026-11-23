@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: delta-exchange-24-7-trader
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: ""
+    startCommand: "node app.js"
+    healthCheckPath: /health
+    envVars:
+      - key: DELTA_ENV
+        value: live_india
+      - key: SCAN_SYMBOL
+        value: XRPUSD
+      - key: SCAN_INTERVAL_SECONDS
+        value: "60"
+      - key: DELTA_API_KEY
+        sync: false
+      - key: DELTA_API_SECRET
+        sync: false

@@ -1,0 +1,93 @@
+//@version=5
+strategy("Delta Exchange 1:3 RRR (Max 3 Trades/Day UTC)", overlay=true, initial_capital=1000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ==========================================
+// 1. INPUT PARAMETERS
+// ==========================================
+rrr_multiplier = input.int(3, title="Risk-to-Reward Multiplier (1:2 or 1:3)", minval=2, maxval=3)
+max_trades_per_day = input.int(3, title="Max Trades Per UTC Day", minval=1, maxval=5)
+atr_length = input.int(14, title="ATR Length for Dynamic Stop Loss")
+atr_multiplier = input.float(1.5, title="ATR Multiplier for Stop Distance")
+symbol_name = input.string("BTC-PERP", title="Delta Exchange Symbol")
+
+// EMA Trend Filter
+fast_ema = ta.ema(close, 20)
+slow_ema = ta.ema(close, 50)
+plot(fast_ema, color=color.blue, title="20 EMA")
+plot(slow_ema, color=color.orange, title="50 EMA")
+
+// ==========================================
+// 2. DAILY TRADE LIMIT RULE (UTC RESET)
+// ==========================================
+// Check if a new calendar day has started in UTC
+new_day = ta.change(time("D"))
+
+var int tradesToday = 0
+if new_day
+    tradesToday := 0
+
+can_trade_today = (tradesToday < max_trades_per_day)
+
+// ==========================================
+// 3. TECHNICAL SIGNAL GENERATION (Trend Pullback)
+// ==========================================
+atr = ta.atr(atr_length)
+
+bullish_crossover = ta.crossover(fast_ema, slow_ema)
+bearish_crossunder = ta.crossunder(fast_ema, slow_ema)
+
+long_condition = bullish_crossover and can_trade_today and (strategy.position_size == 0)
+short_condition = bearish_crossunder and can_trade_today and (strategy.position_size == 0)
+
+// ==========================================
+// 4. STOP LOSS & 1:3 TAKE PROFIT CALCULATION
+// ==========================================
+var float long_entry = na
+var float long_sl = na
+var float long_tp = na
+
+var float short_entry = na
+var float short_sl = na
+var float short_tp = na
+
+if long_condition
+    long_entry := close
+    long_sl := close - (atr * atr_multiplier)
+    long_risk = long_entry - long_sl
+    long_tp := long_entry + (long_risk * rrr_multiplier)
+    
+    tradesToday := tradesToday + 1
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit Long", "Long", stop=long_sl, limit=long_tp)
+    
+    // TradingView Alert Payload for Webhook Bridge
+    alert_msg_long = '{"symbol":"' + symbol_name + '","side":"BUY","order_type":"market","entry_price":' + str.tostring(long_entry) + ',"stop_loss":' + str.tostring(long_sl) + ',"take_profit":' + str.tostring(long_tp) + ',"rrr":' + str.tostring(rrr_multiplier) + '}'
+    alert(alert_msg_long, alert.freq_once_per_bar_close)
+
+if short_condition
+    short_entry := close
+    short_sl := close + (atr * atr_multiplier)
+    short_risk = short_sl - short_entry
+    short_tp := short_entry - (short_risk * rrr_multiplier)
+    
+    tradesToday := tradesToday + 1
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Exit Short", "Short", stop=short_sl, limit=short_tp)
+    
+    // TradingView Alert Payload for Webhook Bridge
+    alert_msg_short = '{"symbol":"' + symbol_name + '","side":"SELL","order_type":"market","entry_price":' + str.tostring(short_entry) + ',"stop_loss":' + str.tostring(short_sl) + ',"take_profit":' + str.tostring(short_tp) + ',"rrr":' + str.tostring(rrr_multiplier) + '}'
+    alert(alert_msg_short, alert.freq_once_per_bar_close)
+
+// ==========================================
+// 5. VISUAL DASHBOARD ON CHART
+// ==========================================
+var table status_table = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 20), border_width=1)
+if barstate.islast
+    table.cell(status_table, 0, 0, "Daily Trade Cap", text_color=color.white, text_size=size.small)
+    table.cell(status_table, 1, 0, str.tostring(tradesToday) + " / " + str.tostring(max_trades_per_day), text_color=(tradesToday >= max_trades_per_day ? color.red : color.green), text_size=size.small)
+    
+    table.cell(status_table, 0, 1, "Status", text_color=color.white, text_size=size.small)
+    table.cell(status_table, 1, 1, (tradesToday >= max_trades_per_day ? "STANDBY (00:00 UTC)" : "ACTIVE"), text_color=(tradesToday >= max_trades_per_day ? color.orange : color.green), text_size=size.small)
+    
+    table.cell(status_table, 0, 2, "RRR Ratio", text_color=color.white, text_size=size.small)
+    table.cell(status_table, 1, 2, "1:" + str.tostring(rrr_multiplier), text_color=color.aqua, text_size=size.small)

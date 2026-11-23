@@ -1,0 +1,24 @@
+{
+  "name": "delta-exchange-24-7-cloud-trader",
+  "version": "1.0.0",
+  "description": "24/7 Cloud Background Strategy Scanner and Execution Bridge for Delta Exchange India",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "scanner": "node strategy_scanner.js",
+    "bridge": "node delta_bridge.js"
+  },
+  "keywords": [
+    "delta-exchange",
+    "trading-bot",
+    "supply-demand",
+    "institutional-orderflow",
+    "crypto-futures",
+    "india"
+  ],
+  "author": "Antigravity & User",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,18 @@
+# Secrets and local configurations
+config.json
+.env
+.env.local
+*.secret.json
+
+# Local state
+daily_trades.json
+
+# Node dependencies and logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
