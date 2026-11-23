@@ -868,10 +868,10 @@ function startServer() {
                     <div style="font-size: 20px; font-weight: bold; color: #6ee7b7; display: flex; align-items: center; gap: 8px;">
                         <span id="scanner-status-pulse">🟢</span>
                         <span>24/7 Cloud Strategy Scanner (Option 2)</span>
-                        <span id="scanner-badge" style="font-size: 11px; background: #059669; color: white; padding: 2px 8px; border-radius: 99px;">ACTIVE IN CLOUD</span>
+                        <span id="scanner-badge" style="font-size: 11px; background: #059669; color: white; padding: 2px 8px; border-radius: 99px;">ACTIVE & WAITING FOR SETUP</span>
                     </div>
                     <div id="scanner-subtitle" style="color: #94a3b8; font-size: 13px; margin-top: 4px;">
-                        Continuously monitoring 15M candle closes for 4H Trend & Base Retests. Your PC can stay powered OFF 24/7.
+                        🛡️ <strong>Hands-Free Automated Mode:</strong> Continuously evaluating 15M candle closes. It <em>only</em> executes when price retests the zone. <strong>No clicking required!</strong>
                     </div>
                 </div>
                 <div style="display: flex; gap: 10px;">
@@ -879,7 +879,7 @@ function startServer() {
                         ⏸️ Pause Scanner
                     </button>
                     <button class="btn btn-secondary" onclick="fetchScannerStatus(true)" style="font-size: 14px; padding: 10px 14px;">
-                        🔄 Scan Now
+                        🔄 Refresh Scan
                     </button>
                 </div>
             </div>
@@ -917,20 +917,20 @@ function startServer() {
             </div>
         </div>
 
-        <!-- 100% AI Autopilot Box -->
-        <div style="background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); border: 2px solid #6366f1; border-radius: 12px; padding: 22px; margin-bottom: 24px; box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.2);">
+        <!-- Optional Manual Instant Trade Box -->
+        <div style="background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); border: 1px solid #4338ca; border-radius: 12px; padding: 20px; margin-bottom: 24px;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
                 <div>
-                    <div style="font-size: 20px; font-weight: bold; color: #a5b4fc; display: flex; align-items: center; gap: 8px;">
-                        <span>🤖 100% AI Autopilot: Market Analysis & Auto-Position</span>
-                        <span style="font-size: 11px; background: #4f46e5; color: white; padding: 2px 8px; border-radius: 99px;">HANDS-FREE</span>
+                    <div style="font-size: 18px; font-weight: bold; color: #a5b4fc; display: flex; align-items: center; gap: 8px;">
+                        <span>⚡ Optional: Force Immediate Market Order (Manual)</span>
+                        <span style="font-size: 11px; background: #3730a3; color: #c7d2fe; padding: 2px 8px; border-radius: 99px;">MANUAL OVERRIDE</span>
                     </div>
                     <div style="color: #94a3b8; font-size: 13px; margin-top: 4px;">
-                        AI decides BUY vs SELL from live order flow & OI surge, auto-sizes lots to your balance, and places 1:3 bracket on Delta!
+                        ⚠️ <em>Note:</em> The 24/7 Scanner above already runs automatically and waits for candle retests. Only click this button if you want to skip the strategy wait and force an immediate trade right now.
                     </div>
                 </div>
-                <button class="btn" onclick="triggerAutopilot()" id="btn-autopilot" style="background: #4f46e5; font-size: 16px; padding: 14px 28px; box-shadow: 0 4px 15px rgba(79, 70, 229, 0.4); border: 1px solid #818cf8;">
-                    🚀 RUN AUTOPILOT & TAKE POSITION
+                <button class="btn" onclick="triggerAutopilot()" id="btn-autopilot" style="background: #3730a3; font-size: 14px; padding: 12px 24px; border: 1px solid #6366f1;">
+                    ⚡ Force Immediate Trade (Skip Wait)
                 </button>
             </div>
             <div id="autopilot-card" style="display: none; background: #070a12; border: 1px solid #4338ca; border-radius: 8px; padding: 14px; margin-top: 14px;">
