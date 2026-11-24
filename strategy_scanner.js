@@ -6,8 +6,8 @@
  * - Detects 4H Macro Trend (50 EMA)
  * - Detects Base Candles with >= 1.6x ATR displacement (Supply / Demand zones)
  * - Detects unmitigated zone retests
- * - Automatically checks live balance (₹51+), sizes lots, adapts leverage, and executes
- * - Enforces Max 3 trades per calendar day
+ * - Multi-Asset Analysis (XRPUSD, BTCUSD, ETHUSD, SOLUSD)
+ * - Provides plain-language setup diagnostics explaining why setup is or isn't built
  */
 
 const https = require('https');
@@ -57,11 +57,11 @@ class StrategyScanner {
     /**
      * Fetch 15-minute historical candles from Delta Exchange India
      */
-    fetchDeltaCandles(resolution = '15', lookbackDays = 3) {
+    fetchDeltaCandles(symbol = this.symbol, resolution = '15', lookbackDays = 4) {
         return new Promise((resolve, reject) => {
             const now = Math.floor(Date.now() / 1000);
             const from = now - (lookbackDays * 86400);
-            const url = `https://api.india.delta.exchange/v2/chart/history?symbol=${this.symbol}&resolution=${resolution}&from=${from}&to=${now}`;
+            const url = `https://api.india.delta.exchange/v2/chart/history?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${now}`;
 
             https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
                 let data = '';
@@ -122,145 +122,216 @@ class StrategyScanner {
     }
 
     /**
+     * Deep Market Setup Diagnostic for Any Crypto Asset
+     */
+    async analyzeMarket(targetSymbol = this.symbol) {
+        const candles = await this.fetchDeltaCandles(targetSymbol, '15', 4);
+        if (candles.length < 100) {
+            return {
+                symbol: targetSymbol,
+                error: 'INSUFFICIENT_DATA',
+                message: `Need at least 100 15M candles; received ${candles.length}`
+            };
+        }
+
+        const closedIdx = candles.length - 2;
+        const closedCandle = candles[closedIdx];
+        const currentPrice = candles[candles.length - 1].close;
+
+        // 1. Calculate 4H 50 EMA on 15M candles (4H = 16 x 15M bars; period = 800)
+        const emaPeriod = Math.min(800, Math.floor(candles.length / 2));
+        const emas = this.computeEMA(candles, emaPeriod);
+        const atrs = this.computeATR(candles, 14);
+
+        const currentEMA = emas[closedIdx];
+        const currentATR = atrs[closedIdx];
+        const isBullishTrend = closedCandle.close > currentEMA;
+
+        // 2. Identify Fresh Institutional Supply & Demand Zones
+        const detectedZones = [];
+        for (let i = 3; i <= closedIdx; i++) {
+            const p1 = candles[i - 1]; // Displacement candle
+            const base = candles[i - 2]; // Base candle
+            const atr = atrs[i - 1];
+            const p1Body = Math.abs(p1.close - p1.open);
+
+            // Demand Zone (Bullish base before explosive expansion)
+            if (p1.close > p1.open && p1Body >= atr * 1.6 && p1.close > base.high) {
+                const sl = parseFloat((base.low - (base.low * 0.0008)).toFixed(4));
+                const entry = parseFloat(Math.max(base.open, base.close).toFixed(4));
+                const risk = Math.abs(entry - sl);
+                const tp = parseFloat((entry + (risk * 3)).toFixed(4));
+
+                detectedZones.push({
+                    type: 'DEMAND',
+                    side: 'BUY',
+                    top: Math.max(base.open, base.close),
+                    bottom: base.low,
+                    sl: sl,
+                    entryLimit: entry,
+                    tp: tp,
+                    riskDist: parseFloat(risk.toFixed(4)),
+                    rewardDist: parseFloat((risk * 3).toFixed(4)),
+                    time: base.time,
+                    mitigated: false
+                });
+            }
+
+            // Supply Zone (Bearish base before explosive plunge)
+            if (p1.open > p1.close && p1Body >= atr * 1.6 && p1.close < base.low) {
+                const sl = parseFloat((base.high + (base.high * 0.0008)).toFixed(4));
+                const entry = parseFloat(Math.min(base.open, base.close).toFixed(4));
+                const risk = Math.abs(sl - entry);
+                const tp = parseFloat((entry - (risk * 3)).toFixed(4));
+
+                detectedZones.push({
+                    type: 'SUPPLY',
+                    side: 'SELL',
+                    top: base.high,
+                    bottom: Math.min(base.open, base.close),
+                    sl: sl,
+                    entryLimit: entry,
+                    tp: tp,
+                    riskDist: parseFloat(risk.toFixed(4)),
+                    rewardDist: parseFloat((risk * 3).toFixed(4)),
+                    time: base.time,
+                    mitigated: false
+                });
+            }
+        }
+
+        // Check zone mitigation
+        for (let z = 0; z < detectedZones.length; z++) {
+            const zone = detectedZones[z];
+            for (let k = closedIdx - 12; k < closedIdx; k++) {
+                if (k >= 0) {
+                    if (zone.type === 'DEMAND' && candles[k].low <= zone.top) {
+                        zone.mitigated = true;
+                    }
+                    if (zone.type === 'SUPPLY' && candles[k].high >= zone.bottom) {
+                        zone.mitigated = true;
+                    }
+                }
+            }
+        }
+
+        const freshDemand = detectedZones.filter(z => z.type === 'DEMAND' && !z.mitigated).slice(-1)[0];
+        const freshSupply = detectedZones.filter(z => z.type === 'SUPPLY' && !z.mitigated).slice(-1)[0];
+
+        let targetZone = null;
+        let distPct = null;
+        let distUsd = null;
+        let setupStatus = 'NO_DISPLACEMENT_ZONE';
+        let setupStatusLabel = '⚪ NO SETUP YET: CONSOLIDATING';
+        let simpleExplanation = '';
+
+        if (isBullishTrend && freshDemand) {
+            targetZone = freshDemand;
+            distUsd = parseFloat(Math.abs(currentPrice - freshDemand.entryLimit).toFixed(4));
+            distPct = parseFloat((((currentPrice - freshDemand.entryLimit) / currentPrice) * 100).toFixed(2));
+
+            const touchedDemand = (closedCandle.low <= freshDemand.top && closedCandle.close >= freshDemand.bottom);
+            if (touchedDemand) {
+                setupStatus = 'READY_FOR_EXECUTION';
+                setupStatusLabel = '🟢 SETUP READY: RETEST CONFIRMED';
+                simpleExplanation = `Bullish trend confirmed (above 4H EMA $${currentEMA.toFixed(4)}). The 15M candle closed at $${closedCandle.close.toFixed(4)}, successfully tapping into the Demand Zone ($${freshDemand.entryLimit.toFixed(4)}). Setup is fully built for 1:3 RRR long.`;
+            } else {
+                setupStatus = 'WAITING_FOR_RETEST';
+                setupStatusLabel = '🟡 SETUP FORMING: WAITING FOR PULLBACK';
+                simpleExplanation = `Macro trend is BULLISH above 4H EMA ($${currentEMA.toFixed(4)}). Fresh institutional Demand Zone is at $${freshDemand.entryLimit.toFixed(4)} (SL: $${freshDemand.sl.toFixed(4)} | TP: $${freshDemand.tp.toFixed(4)}). Current price is $${currentPrice.toFixed(4)}, which is ${distPct}% ($${distUsd}) above the zone. Setup is NOT executed yet because price must pull back and test $${freshDemand.entryLimit.toFixed(4)} without closing below $${freshDemand.sl.toFixed(4)}. You can wait for the 24/7 background scanner, or place a resting Zone Limit Order directly on Delta Exchange.`;
+            }
+        } else if (!isBullishTrend && freshSupply) {
+            targetZone = freshSupply;
+            distUsd = parseFloat(Math.abs(freshSupply.entryLimit - currentPrice).toFixed(4));
+            distPct = parseFloat((((freshSupply.entryLimit - currentPrice) / currentPrice) * 100).toFixed(2));
+
+            const touchedSupply = (closedCandle.high >= freshSupply.bottom && closedCandle.close <= freshSupply.top);
+            if (touchedSupply) {
+                setupStatus = 'READY_FOR_EXECUTION';
+                setupStatusLabel = '🟢 SETUP READY: RETEST CONFIRMED';
+                simpleExplanation = `Bearish trend confirmed (below 4H EMA $${currentEMA.toFixed(4)}). The 15M candle closed at $${closedCandle.close.toFixed(4)}, successfully tapping into the Supply Zone ($${freshSupply.entryLimit.toFixed(4)}). Setup is fully built for 1:3 RRR short.`;
+            } else {
+                setupStatus = 'WAITING_FOR_RETEST';
+                setupStatusLabel = '🟡 SETUP FORMING: WAITING FOR RALLY';
+                simpleExplanation = `Macro trend is BEARISH below 4H EMA ($${currentEMA.toFixed(4)}). Fresh institutional Supply Zone is at $${freshSupply.entryLimit.toFixed(4)} (SL: $${freshSupply.sl.toFixed(4)} | TP: $${freshSupply.tp.toFixed(4)}). Current price is $${currentPrice.toFixed(4)}, which is ${distPct}% ($${distUsd}) below the zone. Setup is NOT executed yet because price must rally into $${freshSupply.entryLimit.toFixed(4)} without closing above $${freshSupply.sl.toFixed(4)}. You can wait for the 24/7 background scanner, or place a resting Zone Limit Order directly on Delta Exchange.`;
+            }
+        } else {
+            setupStatus = 'NO_DISPLACEMENT_ZONE';
+            setupStatusLabel = '⚪ NO SETUP YET: CONSOLIDATING';
+            simpleExplanation = `Macro trend is ${isBullishTrend ? 'BULLISH' : 'BEARISH'} (4H EMA is at $${currentEMA.toFixed(4)}). However, no base candle with explosive displacement (>= 1.6x ATR) was formed in the recent lookback window. The market is consolidating without clear institutional displacement. Setup is NOT built yet.`;
+        }
+
+        return {
+            symbol: targetSymbol,
+            livePrice: currentPrice,
+            candleClose: closedCandle.close,
+            candleTime: new Date(closedCandle.time).toISOString(),
+            trend: isBullishTrend ? 'BULLISH' : 'BEARISH',
+            trendConfluence: isBullishTrend ? 'BUY_ONLY' : 'SELL_ONLY',
+            ema4h: parseFloat(currentEMA.toFixed(4)),
+            atr14: parseFloat(currentATR.toFixed(4)),
+            setupBuilt: setupStatus !== 'NO_DISPLACEMENT_ZONE',
+            setupStatus: setupStatus,
+            setupStatusLabel: setupStatusLabel,
+            targetZone: targetZone ? {
+                type: targetZone.type,
+                side: targetZone.side,
+                entryLimit: targetZone.entryLimit,
+                sl: targetZone.sl,
+                tp: targetZone.tp,
+                riskDist: targetZone.riskDist,
+                rewardDist: targetZone.rewardDist,
+                rrr: '1:3',
+                distanceUsd: distUsd,
+                distancePct: distPct
+            } : null,
+            simpleExplanation: simpleExplanation,
+            analysisTime: new Date().toISOString()
+        };
+    }
+
+    /**
      * Run a single scan on latest closed candles
      */
     async scanOnce() {
         const timestampStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
         try {
-            const candles = await this.fetchDeltaCandles('15', 4);
-            if (candles.length < 100) {
-                this.logMessage(`[SCANNER] Insufficient candle data (${candles.length}). Waiting...`);
+            const analysis = await this.analyzeMarket(this.symbol);
+            if (analysis.error) {
+                this.logMessage(`[SCANNER] ${analysis.message}`);
                 return;
             }
 
-            // Closed candle is at index length - 2 (index length - 1 is the currently forming candle)
-            const closedIdx = candles.length - 2;
-            const closedCandle = candles[closedIdx];
-
-            if (closedCandle.time === this.lastCheckedBarTime) {
-                // Candle already processed; update live price only
-                const currentPrice = candles[candles.length - 1].close;
-                this.latestStatus.livePrice = currentPrice;
+            if (analysis.candleTime === this.latestStatus.lastBarTime) {
+                this.latestStatus.livePrice = analysis.livePrice;
                 return;
             }
 
-            this.lastCheckedBarTime = closedCandle.time;
-            const currentPrice = candles[candles.length - 1].close;
-
-            // 1. Calculate 4H 50 EMA on 15M candles (4H = 16 x 15M bars; period = 800)
-            const emaPeriod = Math.min(800, Math.floor(candles.length / 2));
-            const emas = this.computeEMA(candles, emaPeriod);
-            const atrs = this.computeATR(candles, 14);
-
-            const currentEMA = emas[closedIdx];
-            const currentATR = atrs[closedIdx];
-            const isBullishTrend = closedCandle.close > currentEMA;
-
-            // 2. Identify Fresh Institutional Supply & Demand Zones
-            this.activeZones = [];
-            for (let i = 3; i <= closedIdx; i++) {
-                const p1 = candles[i - 1]; // Displacement candle
-                const base = candles[i - 2]; // Base candle
-                const atr = atrs[i - 1];
-                const p1Body = Math.abs(p1.close - p1.open);
-
-                // Demand Zone (Bullish base before explosive expansion)
-                if (p1.close > p1.open && p1Body >= atr * 1.6 && p1.close > base.high) {
-                    this.activeZones.push({
-                        type: 'DEMAND',
-                        side: 'BUY',
-                        top: Math.max(base.open, base.close),
-                        bottom: base.low,
-                        sl: parseFloat((base.low - (base.low * 0.0008)).toFixed(4)),
-                        entryLimit: parseFloat(Math.max(base.open, base.close).toFixed(4)),
-                        time: base.time,
-                        mitigated: false
-                    });
-                }
-
-                // Supply Zone (Bearish base before explosive plunge)
-                if (p1.open > p1.close && p1Body >= atr * 1.6 && p1.close < base.low) {
-                    this.activeZones.push({
-                        type: 'SUPPLY',
-                        side: 'SELL',
-                        top: base.high,
-                        bottom: Math.min(base.open, base.close),
-                        sl: parseFloat((base.high + (base.high * 0.0008)).toFixed(4)),
-                        entryLimit: parseFloat(Math.min(base.open, base.close).toFixed(4)),
-                        time: base.time,
-                        mitigated: false
-                    });
-                }
-            }
-
-            // Invalidate mitigated zones
-            for (let z = 0; z < this.activeZones.length; z++) {
-                const zone = this.activeZones[z];
-                for (let k = closedIdx - 10; k < closedIdx; k++) {
-                    if (k >= 0) {
-                        if (zone.type === 'DEMAND' && candles[k].low <= zone.top) {
-                            zone.mitigated = true;
-                        }
-                        if (zone.type === 'SUPPLY' && candles[k].high >= zone.bottom) {
-                            zone.mitigated = true;
-                        }
-                    }
-                }
-            }
-
-            const freshDemand = this.activeZones.filter(z => z.type === 'DEMAND' && !z.mitigated).slice(-1)[0];
-            const freshSupply = this.activeZones.filter(z => z.type === 'SUPPLY' && !z.mitigated).slice(-1)[0];
-
-            let activeTargetZone = null;
-            let distPct = null;
-
-            if (isBullishTrend && freshDemand) {
-                activeTargetZone = freshDemand;
-                distPct = parseFloat((((currentPrice - freshDemand.entryLimit) / currentPrice) * 100).toFixed(2));
-            } else if (!isBullishTrend && freshSupply) {
-                activeTargetZone = freshSupply;
-                distPct = parseFloat((((freshSupply.entryLimit - currentPrice) / currentPrice) * 100).toFixed(2));
-            }
-
-            // Update status object
             this.latestStatus = {
                 running: this.isRunning,
                 symbol: this.symbol,
                 lastScanTime: timestampStr,
-                lastBarTime: new Date(closedCandle.time).toISOString(),
-                candleClose: closedCandle.close,
-                livePrice: currentPrice,
-                trend: isBullishTrend ? 'BULLISH' : 'BEARISH',
-                ema4h: parseFloat(currentEMA.toFixed(4)),
-                targetZone: activeTargetZone,
-                distancePct: distPct,
-                summary: activeTargetZone 
-                    ? `Trend: ${isBullishTrend ? 'BULLISH' : 'BEARISH'} | Target ${activeTargetZone.type}: $${activeTargetZone.entryLimit} (${distPct}% away) | Waiting for 15M Retest`
-                    : `Trend: ${isBullishTrend ? 'BULLISH' : 'BEARISH'} | Scanning for fresh unmitigated zones`
+                lastBarTime: analysis.candleTime,
+                candleClose: analysis.candleClose,
+                livePrice: analysis.livePrice,
+                trend: analysis.trend,
+                ema4h: analysis.ema4h,
+                setupBuilt: analysis.setupBuilt,
+                setupStatus: analysis.setupStatus,
+                setupStatusLabel: analysis.setupStatusLabel,
+                targetZone: analysis.targetZone,
+                distancePct: analysis.targetZone ? analysis.targetZone.distancePct : null,
+                distanceUsd: analysis.targetZone ? analysis.targetZone.distanceUsd : null,
+                summary: analysis.simpleExplanation
             };
 
-            this.logMessage(`[SCAN] 15M Bar Closed: $${closedCandle.close.toFixed(4)} | Live: $${currentPrice.toFixed(4)} | 4H Trend: ${isBullishTrend ? '🟢 BULLISH' : '🔴 BEARISH'}`);
+            this.logMessage(`[SCAN] 15M Closed: $${analysis.candleClose} | Live: $${analysis.livePrice} | Trend: ${analysis.trend === 'BULLISH' ? '🟢 BULLISH' : '🔴 BEARISH'}`);
 
-            if (isBullishTrend && freshDemand) {
-                this.logMessage(`[TARGET] Fresh Demand: $${freshDemand.entryLimit.toFixed(4)} (SL: $${freshDemand.sl.toFixed(4)}) | Distance: ${distPct}%`);
-
-                // RETEST CHECK: Did latest candle tap the Demand Zone?
-                const touchedDemand = (closedCandle.low <= freshDemand.top && closedCandle.close >= freshDemand.bottom);
-                if (touchedDemand) {
-                    this.logMessage(`🔥 [SIGNAL TRIGGERED] Retest confirmed at Demand Zone $${freshDemand.entryLimit}! Auto-executing...`);
-                    await this.executeStrategySignal(freshDemand, closedCandle.close);
-                    return;
-                }
-            } else if (!isBullishTrend && freshSupply) {
-                this.logMessage(`[TARGET] Fresh Supply: $${freshSupply.entryLimit.toFixed(4)} (SL: $${freshSupply.sl.toFixed(4)}) | Distance: ${distPct}%`);
-
-                // RETEST CHECK: Did latest candle tap the Supply Zone?
-                const touchedSupply = (closedCandle.high >= freshSupply.bottom && closedCandle.close <= freshSupply.top);
-                if (touchedSupply) {
-                    this.logMessage(`🔥 [SIGNAL TRIGGERED] Retest confirmed at Supply Zone $${freshSupply.entryLimit}! Auto-executing...`);
-                    await this.executeStrategySignal(freshSupply, closedCandle.close);
-                    return;
-                }
+            if (analysis.setupStatus === 'READY_FOR_EXECUTION') {
+                this.logMessage(`🔥 [SIGNAL TRIGGERED] Retest confirmed at ${analysis.targetZone.type} $${analysis.targetZone.entryLimit}! Auto-executing...`);
+                await this.executeStrategySignal(analysis.targetZone, analysis.candleClose);
+            } else if (analysis.targetZone) {
+                this.logMessage(`[TARGET] ${analysis.targetZone.type}: $${analysis.targetZone.entryLimit} (SL: $${analysis.targetZone.sl} | TP: $${analysis.targetZone.tp}) | Distance: ${analysis.targetZone.distancePct}%`);
             } else {
                 this.logMessage(`[STATUS] No fresh unmitigated zones in immediate window. Standing by for next 15M candle.`);
             }
@@ -278,15 +349,12 @@ class StrategyScanner {
         const balRes = await fetchDeltaBalance(config);
         const balance = balRes.success ? balRes.available_balance : 0.60;
 
-        const riskDist = Math.abs(entryPrice - zone.sl);
-        const tp = zone.side === 'BUY' ? entryPrice + (riskDist * 3) : entryPrice - (riskDist * 3);
-
         const payload = {
             symbol: this.symbol,
             side: zone.side,
             entry_price: entryPrice,
             stop_loss: zone.sl,
-            take_profit: parseFloat(tp.toFixed(4)),
+            take_profit: zone.tp,
             rrr: 3,
             size: 1, // Auto-sized for margin safety
             leverage: 10,
@@ -294,7 +362,7 @@ class StrategyScanner {
             order_type: 'market'
         };
 
-        this.logMessage(`[DISPATCHING TO DELTA INDIA] ${zone.side} ${this.symbol} @ $${entryPrice} (SL: $${zone.sl} | TP: $${tp.toFixed(4)})`);
+        this.logMessage(`[DISPATCHING TO DELTA INDIA] ${zone.side} ${this.symbol} @ $${entryPrice} (SL: $${zone.sl} | TP: $${zone.tp})`);
         const result = await handleTradeSignal(payload);
         this.logMessage(`[EXECUTION RESULT]: Verdict=${result.verdict} | RejectReason=${result.reject_reason || 'NONE'}`);
         this.latestStatus.lastSignal = {

@@ -1,12 +1,15 @@
 /**
- * Master Execution Bridge for Delta Exchange (Live India & Global)
+ * Master Execution Bridge for Delta Exchange India
  * 
  * Includes:
  * - Dynamic Risk-Based Position Sizer (Auto-calculates safe lot size based on 1% or 2% risk)
  * - Pre-Trade Margin & Balance Safety Check (Prevents liquidation / insufficient margin errors)
- * - Multi-Asset Support (BTCUSD, XRPUSD, ETHUSD, SOLUSD)
- * - Strict 1:3 RRR Bracket Orders (Entry, Stop-Loss, Take-Profit)
- * - Forex Factory News Filter & CoinGlass Liquidity Confluence
+ * - Multi-Asset Support (XRPUSD, BTCUSD, ETHUSD, SOLUSD)
+ * - Dual-Execution Modes:
+ *     Option 1: 24/7 Cloud Background Candle Scanner (Waits for 15M bar retest & executes)
+ *     Option 2: Resting Zone Limit Order (Places limit order at zone price on Delta with bracket SL/TP)
+ * - Institutional Terminal UI with PIN-Protected Exclusive User Access
+ * - Live Delta India Positions & Open Orders Manager
  */
 
 const http = require('http');
@@ -29,6 +32,7 @@ function setActiveScanner(scanner) {
 function loadConfig() {
     let conf = {
         port: process.env.PORT ? parseInt(process.env.PORT, 10) : 5050,
+        access_pin: process.env.ACCESS_PIN || 'delta2026',
         delta: {
             environment: process.env.DELTA_ENV || 'live_india',
             api_key: process.env.DELTA_API_KEY || '',
@@ -66,6 +70,7 @@ function loadConfig() {
     if (process.env.DELTA_API_SECRET) conf.delta.api_secret = process.env.DELTA_API_SECRET;
     if (process.env.DELTA_ENV) conf.delta.environment = process.env.DELTA_ENV;
     if (process.env.PORT) conf.port = parseInt(process.env.PORT, 10);
+    if (process.env.ACCESS_PIN) conf.access_pin = process.env.ACCESS_PIN;
 
     return conf;
 }
@@ -92,10 +97,6 @@ function getDeltaWebUrl(environment, symbol = 'XRPUSD') {
             return `https://india.delta.exchange/app/futures/trade/${clean}`;
         case 'live_global':
             return `https://delta.exchange/app/futures/trade/${clean}`;
-        case 'testnet_global':
-            return `https://testnet-global.delta.exchange/app/futures/trade/${clean}`;
-        case 'testnet_india':
-        case 'testnet':
         default:
             return `https://testnet.delta.exchange/app/futures/trade/${clean}`;
     }
@@ -106,7 +107,7 @@ function createDeltaSignature(secret, method, timestamp, pathStr, queryString = 
     return crypto.createHmac('sha256', secret).update(message).digest('hex');
 }
 
-// Verified Live Product IDs for Delta Exchange India
+// Verified Product IDs for Delta Exchange India
 const productCache = {
     'BTCUSD': 27,
     'ETHUSD': 3136,
@@ -114,55 +115,80 @@ const productCache = {
     'SOLUSD': 14823
 };
 
-// Contract multipliers: how much underlying crypto 1 contract represents
+// Contract multipliers
 const contractMultipliers = {
-    'XRPUSD': 1.0,    // 1 contract = 1 XRP
-    'BTCUSD': 0.001,  // 1 contract = 0.001 BTC
-    'ETHUSD': 0.01,   // 1 contract = 0.01 ETH
-    'SOLUSD': 0.1     // 1 contract = 0.1 SOL
+    'XRPUSD': 1.0,    // 1 contract = 1 XRP (~$0.95 notional)
+    'BTCUSD': 0.001,  // 1 contract = 0.001 BTC (~$60 notional)
+    'ETHUSD': 0.01,   // 1 contract = 0.01 ETH (~$17 notional)
+    'SOLUSD': 0.1     // 1 contract = 0.1 SOL (~$7.10 notional)
 };
 
 function getContractMultiplier(symbol) {
-    const clean = (symbol || 'XRPUSD').replace('-PERP', '').replace('USDT', 'USD').toUpperCase();
+    const clean = symbol.replace('-PERP', '').replace('USDT', 'USD').toUpperCase();
     return contractMultipliers[clean] || 1.0;
 }
 
-function getProductId(host, symbol) {
+async function getProductId(host, symbol) {
+    const clean = symbol.replace('-PERP', '').replace('USDT', 'USD').toUpperCase();
+    if (productCache[clean]) {
+        return productCache[clean];
+    }
+    return 14969; // Default to XRPUSD
+}
+
+function calculateAdaptiveLeverage(notionalValue, accountBalance, requestedLeverage, maxLeverage = 100) {
+    const leverageSteps = [10, 15, 20, 25, 30, 40, 50, 75, 100];
+    let startIdx = leverageSteps.findIndex(l => l >= requestedLeverage);
+    if (startIdx === -1) startIdx = 0;
+
+    for (let i = startIdx; i < leverageSteps.length; i++) {
+        const lev = leverageSteps[i];
+        if (lev > maxLeverage) break;
+        const reqMargin = notionalValue / lev;
+        if (reqMargin <= (accountBalance * 0.45)) {
+            return lev;
+        }
+    }
+    return Math.min(maxLeverage, 100);
+}
+
+function setDeltaProductLeverage(host, productId, leverage, config) {
     return new Promise((resolve) => {
-        const cleanSymbol = (symbol || 'XRPUSD').replace('-PERP', '').replace('USDT', 'USD').toUpperCase();
-        if (productCache[cleanSymbol]) {
-            return resolve(productCache[cleanSymbol]);
+        if (!config.delta.api_key || !config.delta.api_secret) {
+            return resolve({ success: false, reason: 'MISSING_API_CREDENTIALS' });
         }
 
-        const options = {
-            hostname: host,
-            port: 443,
-            path: '/v2/products',
-            method: 'GET',
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        };
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const pathStr = `/v2/products/${productId}/orders/leverage`;
+        const bodyStr = JSON.stringify({ leverage: String(leverage) });
+        const signature = createDeltaSignature(config.delta.api_secret, 'POST', timestamp, pathStr, '', bodyStr);
 
-        const req = https.request(options, (res) => {
+        const req = https.request({
+            hostname: host,
+            path: pathStr,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'api-key': config.delta.api_key,
+                'timestamp': timestamp,
+                'signature': signature,
+                'User-Agent': 'Mozilla/5.0'
+            }
+        }, (res) => {
             let data = '';
-            res.on('data', chunk => { data += chunk; });
+            res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 try {
                     const parsed = JSON.parse(data);
-                    if (parsed && Array.isArray(parsed.result)) {
-                        for (const p of parsed.result) {
-                            if (p.symbol) {
-                                productCache[p.symbol.toUpperCase()] = p.id;
-                            }
-                        }
-                        const id = productCache[cleanSymbol] || productCache['XRPUSD'] || 14969;
-                        return resolve(id);
-                    }
-                } catch (e) {}
-                resolve(cleanSymbol === 'XRPUSD' ? 14969 : (cleanSymbol === 'ETHUSD' ? 3136 : 27));
+                    resolve({ success: res.statusCode === 200 && parsed.success === true, response: parsed });
+                } catch(e) {
+                    resolve({ success: false, error: e.message, raw: data });
+                }
             });
         });
 
-        req.on('error', () => resolve(cleanSymbol === 'XRPUSD' ? 14969 : (cleanSymbol === 'ETHUSD' ? 3136 : 27)));
+        req.on('error', (err) => resolve({ success: false, error: err.message }));
+        req.write(bodyStr);
         req.end();
     });
 }
@@ -170,236 +196,187 @@ function getProductId(host, symbol) {
 function fetchDeltaBalance(config) {
     return new Promise((resolve) => {
         if (!config.delta.api_key || !config.delta.api_secret) {
-            return resolve({ success: false, available_balance: 0, reason: 'NO_KEYS' });
+            return resolve({ success: false, reason: 'MISSING_API_CREDENTIALS' });
         }
-        const host = getDeltaBaseUrl(config.delta.environment);
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
         const pathStr = '/v2/wallet/balances';
-        const method = 'GET';
-        const timestamp = Math.floor(Date.now() / 1000).toString();
-        const signature = createDeltaSignature(config.delta.api_secret, method, timestamp, pathStr, '', '');
+        const signature = createDeltaSignature(config.delta.api_secret, 'GET', timestamp, pathStr);
+        const host = getDeltaBaseUrl(config.delta.environment);
 
-        const options = {
+        const req = https.request({
             hostname: host,
-            port: 443,
             path: pathStr,
-            method: method,
+            method: 'GET',
             headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0',
-                'api-key': config.delta.api_key,
-                'timestamp': timestamp,
-                'signature': signature
-            }
-        };
-
-        const req = https.request(options, (res) => {
-            let data = '';
-            res.on('data', chunk => { data += chunk; });
-            res.on('end', () => {
-                try {
-                    const parsed = JSON.parse(data);
-                    if (parsed && parsed.success && Array.isArray(parsed.result)) {
-                        const usdt = parsed.result.find(b => b.asset_symbol === 'USDT' || b.asset_symbol === 'USD');
-                        const balance = usdt ? parseFloat(usdt.available_balance || usdt.balance) : 0;
-                        return resolve({ success: true, available_balance: balance, raw: parsed.result });
-                    }
-                    resolve({ success: false, available_balance: 0, error: parsed.error });
-                } catch (e) {
-                    resolve({ success: false, available_balance: 0 });
-                }
-            });
-        });
-
-        req.on('error', () => resolve({ success: false, available_balance: 0 }));
-        req.end();
-    });
-}
-
-function calculateAdaptiveLeverage(notionalValue, availableBalance, requestedLeverage = 10, maxLeverage = 100) {
-    if (!availableBalance || availableBalance <= 0) return requestedLeverage;
-    
-    // Safety target: lock at most 35% of total capital in initial margin to keep 65% free buffer
-    const targetMargin = availableBalance * 0.35;
-    const neededLeverage = Math.ceil(notionalValue / targetMargin);
-    
-    if (neededLeverage <= requestedLeverage) {
-        return requestedLeverage;
-    }
-    
-    // Standard exchange leverage tiers
-    const tiers = [10, 15, 20, 25, 30, 40, 50, 75, 100];
-    for (const t of tiers) {
-        if (t >= neededLeverage) {
-            return Math.min(t, maxLeverage);
-        }
-    }
-    return maxLeverage;
-}
-
-function setDeltaProductLeverage(host, productId, leverage, config) {
-    return new Promise((resolve) => {
-        if (!config.delta.api_key || !config.delta.api_secret) {
-            return resolve({ success: false, reason: 'NO_KEYS' });
-        }
-        const pathStr = `/v2/products/${productId}/orders/leverage`;
-        const method = 'POST';
-        const timestamp = Math.floor(Date.now() / 1000).toString();
-        const bodyStr = JSON.stringify({ leverage: leverage.toString() });
-        const signature = createDeltaSignature(config.delta.api_secret, method, timestamp, pathStr, '', bodyStr);
-
-        const options = {
-            hostname: host,
-            port: 443,
-            path: pathStr,
-            method: method,
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0',
                 'api-key': config.delta.api_key,
                 'timestamp': timestamp,
                 'signature': signature,
-                'Content-Length': Buffer.byteLength(bodyStr)
+                'User-Agent': 'Mozilla/5.0'
             }
-        };
-
-        const req = https.request(options, (res) => {
-            let resData = '';
-            res.on('data', chunk => { resData += chunk; });
+        }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 try {
-                    const parsed = JSON.parse(resData);
-                    resolve({ http_status: res.statusCode, response: parsed, success: res.statusCode === 200 && parsed.success === true });
-                } catch (e) {
-                    resolve({ http_status: res.statusCode, raw: resData, success: false });
+                    const parsed = JSON.parse(data);
+                    if (parsed.result && Array.isArray(parsed.result)) {
+                        const usdAsset = parsed.result.find(a => a.asset_symbol === 'USD');
+                        const inrAsset = parsed.result.find(a => a.asset_symbol === 'INR');
+                        const availUsd = usdAsset ? parseFloat(usdAsset.available_balance || 0) : 0;
+                        const inrEquiv = usdAsset && usdAsset.available_balance_inr ? parseFloat(usdAsset.available_balance_inr) : (availUsd * 85);
+                        resolve({
+                            success: true,
+                            available_balance: availUsd,
+                            available_balance_inr: inrEquiv,
+                            raw: parsed.result
+                        });
+                    } else {
+                        resolve({ success: false, reason: 'NO_BALANCE_FOUND', response: parsed });
+                    }
+                } catch (err) {
+                    resolve({ success: false, reason: 'PARSE_ERROR', error: err.message });
                 }
             });
         });
 
-        req.on('error', err => resolve({ status: 'NETWORK_ERROR', message: err.message, success: false }));
-        req.write(bodyStr);
+        req.on('error', (err) => resolve({ success: false, reason: 'NETWORK_ERROR', error: err.message }));
         req.end();
     });
 }
 
-function fetchLiveTicker(symbol, host) {
-    return new Promise((resolve, reject) => {
-        const cleanSymbol = (symbol || 'XRPUSD').replace('-PERP', '').replace('USDT', 'USD').toUpperCase();
-        const options = {
-            hostname: host,
-            port: 443,
-            path: `/v2/tickers/${cleanSymbol}`,
-            method: 'GET',
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        };
+function fetchDeltaPositions(config) {
+    return new Promise((resolve) => {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const pathStr = '/v2/positions/margined';
+        const signature = createDeltaSignature(config.delta.api_secret, 'GET', timestamp, pathStr);
+        const host = getDeltaBaseUrl(config.delta.environment);
 
-        https.get(options, (res) => {
+        const req = https.request({
+            hostname: host,
+            path: pathStr,
+            method: 'GET',
+            headers: {
+                'api-key': config.delta.api_key,
+                'timestamp': timestamp,
+                'signature': signature,
+                'User-Agent': 'Mozilla/5.0'
+            }
+        }, (res) => {
             let data = '';
-            res.on('data', chunk => { data += chunk; });
+            res.on('data', c => data += c);
             res.on('end', () => {
                 try {
                     const parsed = JSON.parse(data);
-                    if (parsed && parsed.result) {
-                        return resolve(parsed.result);
-                    }
-                    reject(new Error('Ticker data missing in response'));
-                } catch (e) {
-                    reject(e);
+                    resolve({ success: true, positions: parsed.result || [] });
+                } catch(e) {
+                    resolve({ success: false, error: e.message, positions: [] });
                 }
             });
-        }).on('error', reject);
+        });
+        req.on('error', (err) => resolve({ success: false, error: err.message, positions: [] }));
+        req.end();
     });
 }
 
-async function runAutopilotAnalysis(symbol, config, inputBalance = null, riskPercent = 2, leverage = 10) {
-    const host = getDeltaBaseUrl(config.delta.environment);
-    const ticker = await fetchLiveTicker(symbol, host);
+function fetchDeltaOrders(config) {
+    return new Promise((resolve) => {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const pathStr = '/v2/orders?state=open';
+        const signature = createDeltaSignature(config.delta.api_secret, 'GET', timestamp, pathStr);
+        const host = getDeltaBaseUrl(config.delta.environment);
 
-    // 1. Determine Market Bias & Side Automatically
-    const isBullish = ticker.close >= ticker.open;
-    const side = isBullish ? 'BUY' : 'SELL';
+        const req = https.request({
+            hostname: host,
+            path: pathStr,
+            method: 'GET',
+            headers: {
+                'api-key': config.delta.api_key,
+                'timestamp': timestamp,
+                'signature': signature,
+                'User-Agent': 'Mozilla/5.0'
+            }
+        }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    resolve({ success: true, orders: parsed.result || [] });
+                } catch(e) {
+                    resolve({ success: false, error: e.message, orders: [] });
+                }
+            });
+        });
+        req.on('error', (err) => resolve({ success: false, error: err.message, orders: [] }));
+        req.end();
+    });
+}
 
-    // 2. Technical Invalidation Distance (ATR / Dynamic daily range)
-    const dailyRange = ticker.high - ticker.low;
-    const slDist = Math.max(dailyRange * 0.6, ticker.close * 0.02);
+function cancelDeltaOrder(config, orderId) {
+    return new Promise((resolve) => {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const pathStr = `/v2/orders/${orderId}`;
+        const signature = createDeltaSignature(config.delta.api_secret, 'DELETE', timestamp, pathStr);
+        const host = getDeltaBaseUrl(config.delta.environment);
 
-    const entryPrice = ticker.close;
-    const stopLoss = parseFloat((isBullish ? entryPrice - slDist : entryPrice + slDist).toFixed(4));
-    const takeProfit = parseFloat((isBullish ? entryPrice + (slDist * 3) : entryPrice - (slDist * 3)).toFixed(4));
-
-    // 3. Determine Account Balance (Prioritize Live Exchange Balance)
-    const balRes = await fetchDeltaBalance(config);
-    let balance = (balRes.success && balRes.available_balance > 0) ? balRes.available_balance : parseFloat(inputBalance || 100);
-
-    // 4. Automatic Position Sizing Math
-    const multiplier = getContractMultiplier(symbol);
-    const riskPerContract = Math.abs(entryPrice - stopLoss) * multiplier;
-    const targetDollarRisk = balance * (riskPercent / 100);
-    const autoLots = Math.max(1, Math.floor(targetDollarRisk / riskPerContract));
-
-    const notionalValue = autoLots * entryPrice * multiplier;
-    
-    // Dynamic Adaptive Leverage if capital is low
-    const adaptiveLev = calculateAdaptiveLeverage(notionalValue, balance, leverage, 100);
-    const requiredMargin = notionalValue / adaptiveLev;
-
-    const analysisReport = {
-        symbol: symbol.toUpperCase(),
-        decision: side,
-        reasoning: `${side} Signal: Price holding ${isBullish ? 'above' : 'below'} open ($${ticker.open} -> $${ticker.close}) with ${parseFloat(ticker.oi_change_usd_6h || 0) >= 0 ? '+' : ''}$${Math.round(ticker.oi_change_usd_6h || 0).toLocaleString()} 6h Open Interest expansion.`,
-        entry_price: entryPrice,
-        stop_loss: stopLoss,
-        take_profit: takeProfit,
-        rrr: '1:3 (STRICT)',
-        account_balance_used: balance,
-        risk_percent: riskPercent,
-        auto_calculated_lots: autoLots,
-        contract_multiplier: multiplier,
-        notional_value_usd: parseFloat(notionalValue.toFixed(2)),
-        required_margin_usd: parseFloat(requiredMargin.toFixed(2)),
-        max_1r_loss_usd: parseFloat((autoLots * riskPerContract).toFixed(2)),
-        target_3r_profit_usd: parseFloat((autoLots * riskPerContract * 3).toFixed(2)),
-        requested_leverage: `${leverage}x`,
-        adaptive_leverage: `${adaptiveLev}x`,
-        leverage_status: adaptiveLev > leverage
-            ? `Low capital ($${balance.toFixed(2)}) detected! Auto-increased leverage from ${leverage}x to ${adaptiveLev}x to keep required margin ($${requiredMargin.toFixed(2)}) safely within available balance.`
-            : `Capital sufficient. Maintained safe leverage at ${leverage}x.`
-    };
-
-    return analysisReport;
+        const req = https.request({
+            hostname: host,
+            path: pathStr,
+            method: 'DELETE',
+            headers: {
+                'api-key': config.delta.api_key,
+                'timestamp': timestamp,
+                'signature': signature,
+                'Content-Type': 'application/json',
+                'User-Agent': 'Mozilla/5.0'
+            }
+        }, (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    resolve({ success: true, response: parsed });
+                } catch(e) {
+                    resolve({ success: false, error: e.message });
+                }
+            });
+        });
+        req.on('error', (err) => resolve({ success: false, error: err.message }));
+        req.end();
+    });
 }
 
 function executeDeltaApiCall(host, deltaPayload, config) {
     return new Promise((resolve) => {
-        const pathStr = '/v2/orders';
-        const method = 'POST';
-        const timestamp = Math.floor(Date.now() / 1000).toString();
-        const bodyStr = JSON.stringify(deltaPayload);
-        const signature = createDeltaSignature(config.delta.api_secret, method, timestamp, pathStr, '', bodyStr);
+        if (!config.delta.api_key || !config.delta.api_secret) {
+            return resolve({ status: 'SKIPPED', message: 'No API key/secret provided in config.json' });
+        }
 
-        const options = {
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const pathStr = '/v2/orders';
+        const bodyStr = JSON.stringify(deltaPayload);
+        const signature = createDeltaSignature(config.delta.api_secret, 'POST', timestamp, pathStr, '', bodyStr);
+
+        const req = https.request({
             hostname: host,
-            port: 443,
             path: pathStr,
-            method: method,
+            method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'api-key': config.delta.api_key,
                 'timestamp': timestamp,
                 'signature': signature,
-                'Content-Length': Buffer.byteLength(bodyStr)
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': 'application/json'
             }
-        };
-
-        const req = https.request(options, (res) => {
-            let resData = '';
-            res.on('data', chunk => { resData += chunk; });
+        }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 try {
-                    const parsed = JSON.parse(resData);
+                    const parsed = JSON.parse(data);
                     resolve({
                         http_status: res.statusCode,
                         host_used: host,
@@ -410,64 +387,29 @@ function executeDeltaApiCall(host, deltaPayload, config) {
                     resolve({
                         http_status: res.statusCode,
                         host_used: host,
-                        raw: resData,
-                        dispatched_payload: deltaPayload
+                        raw: data,
+                        error: 'Non-JSON response'
                     });
                 }
             });
         });
 
-        req.on('error', err => resolve({ status: 'NETWORK_ERROR', host_attempted: host, message: err.message }));
+        req.on('error', (err) => {
+            resolve({ status: 'NETWORK_ERROR', error: err.message });
+        });
+
         req.write(bodyStr);
         req.end();
     });
 }
 
-async function sendDeltaOrder(orderPayload, config) {
+async function sendDeltaOrder(deltaPayload, config) {
     const primaryHost = getDeltaBaseUrl(config.delta.environment);
-    const productId = await getProductId(primaryHost, orderPayload.symbol);
-    
-    const deltaPayload = {
-        product_id: productId,
-        size: Number(orderPayload.size || 1),
-        side: orderPayload.side.toLowerCase(),
-        order_type: orderPayload.order_type || 'market_order',
-        bracket_stop_loss_price: String(orderPayload.bracket_stop_loss_price),
-        bracket_take_profit_price: String(orderPayload.bracket_take_profit_price),
-        time_in_force: 'gtc'
-    };
-
-    if (deltaPayload.order_type === 'limit_order' && orderPayload.limit_price) {
-        deltaPayload.limit_price = String(orderPayload.limit_price);
+    if (!deltaPayload.product_id) {
+        deltaPayload.product_id = await getProductId(primaryHost, deltaPayload.symbol);
     }
-
-    if (!config.delta.api_key || !config.delta.api_secret) {
-        return {
-            status: 'SIMULATED_SUCCESS',
-            message: 'Delta API credentials not set. Order simulated locally without dispatch.',
-            payload: deltaPayload
-        };
-    }
-
-    let result = await executeDeltaApiCall(primaryHost, deltaPayload, config);
-
-    // Fallback to alternative testnet host if network connection fails or CloudFront blocks
-    if ((result.status === 'NETWORK_ERROR' || result.http_status === 403) && config.delta.environment.includes('testnet')) {
-        const fallbackHosts = ['testnet.delta.exchange', 'testnet-api.delta.exchange'];
-        for (const fbHost of fallbackHosts) {
-            if (fbHost === primaryHost) continue;
-            const fallbackResult = await executeDeltaApiCall(fbHost, deltaPayload, config);
-            if (fallbackResult.http_status === 200 || (fallbackResult.response && fallbackResult.response.success)) {
-                return fallbackResult;
-            }
-            if (fallbackResult.http_status && fallbackResult.http_status !== 403) {
-                result = fallbackResult;
-                break;
-            }
-        }
-    }
-
-    return result;
+    delete deltaPayload.symbol;
+    return await executeDeltaApiCall(primaryHost, deltaPayload, config);
 }
 
 async function handleTradeSignal(signalData) {
@@ -599,32 +541,39 @@ async function handleTradeSignal(signalData) {
                 ...signalData,
                 entryPrice: filterResult.trade_details.entry_price,
                 stopLoss: filterResult.trade_details.stop_loss,
+                takeProfit: filterResult.trade_details.take_profit,
                 commitTrade: true
             });
             results.verdict = 'EXECUTED';
             results.order_id = orderRes.response?.result?.id || 'SUBMITTED';
         } else {
             results.verdict = 'FAILED_ON_EXCHANGE';
-            results.reject_reason = orderRes.response?.error?.message || orderRes.response?.error?.code || orderRes.message || 'Delta API rejected order';
+            results.reject_reason = orderRes.response?.error?.code || orderRes.error || 'ORDER_REJECTED';
         }
     } else {
-        results.steps.delta_exchange_dispatch = {
-            mode: 'DRY_RUN_APPROVED',
-            message: 'Auto-execute is false. Set auto_execute: true in config.json to dispatch live/testnet.',
-            payload: filterResult.delta_exchange_payload
-        };
-        results.verdict = 'READY_TO_EXECUTE';
+        results.verdict = 'DRY_RUN_PASSED';
+        results.dispatched_payload = filterResult.delta_exchange_payload;
     }
 
     return results;
+}
+
+// Authentication Check: Protects user terminal from unauthorized visitors
+function isAuthorized(req, config) {
+    const headerPin = req.headers['x-access-pin'];
+    const authHeader = req.headers['authorization'] || '';
+    const bearerPin = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const queryPin = (req.url || '').includes('pin=') ? new URL(req.url, 'http://localhost').searchParams.get('pin') : '';
+    const expected = String(config.access_pin || 'delta2026').trim();
+    return headerPin === expected || bearerPin === expected || queryPin === expected;
 }
 
 function startServer() {
     const config = loadConfig();
     const server = http.createServer(async (req, res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, api-key, signature, timestamp, Accept');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, api-key, signature, timestamp, Accept, x-access-pin, authorization');
 
         if (req.method === 'OPTIONS') {
             res.writeHead(204);
@@ -633,9 +582,9 @@ function startServer() {
 
         const rawPath = (req.url || '/').split('?')[0];
         const cleanPath = rawPath.toLowerCase().replace(/\/+$/, '') || '/';
-        const hasJsonFormat = (req.url || '').includes('format=json') || req.headers.accept?.includes('application/json');
+        const urlObj = new URL(req.url, 'http://localhost');
 
-        // Cloud Health & Uptime Keep-Alive endpoint (for Render / Railway / UptimeRobot)
+        // Cloud Health & Uptime Keep-Alive endpoint (Always Public for UptimeRobot)
         if (req.method === 'GET' && (cleanPath === '/health' || cleanPath === '/ping')) {
             const limit = checkDailyLimit();
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -648,6 +597,49 @@ function startServer() {
                 environment: config.delta.environment,
                 timestamp: new Date().toISOString()
             }, null, 2));
+        }
+
+        // Auth Verification endpoint (Public)
+        if (req.method === 'POST' && cleanPath === '/api/auth/verify') {
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const inputPin = String(data.pin || '').trim();
+                    const expectedPin = String(config.access_pin || 'delta2026').trim();
+
+                    if (inputPin === expectedPin) {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: true, token: expectedPin }));
+                    } else {
+                        res.writeHead(401, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: false, error: 'INCORRECT_PIN' }));
+                    }
+                } catch(e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: 'INVALID_JSON' }));
+                }
+            });
+            return;
+        }
+
+        // Security check for protected API routes
+        if (cleanPath.startsWith('/api/') || cleanPath === '/webhook' || cleanPath === '/reset-counter') {
+            if (!isAuthorized(req, config)) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({
+                    error: 'UNAUTHORIZED',
+                    message: 'Access restricted to authorized terminal owner. Please unlock terminal with Access PIN.'
+                }));
+            }
+        }
+
+        // Fetch Balance endpoint
+        if (req.method === 'GET' && cleanPath === '/api/balance') {
+            const balRes = await fetchDeltaBalance(config);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify(balRes, null, 2));
         }
 
         // Live Scanner Status endpoint
@@ -672,22 +664,88 @@ function startServer() {
             return res.end(JSON.stringify({ running: activeScanner.isRunning }));
         }
 
-        // Scanner Trigger Single Scan endpoint
-        if (req.method === 'POST' && cleanPath === '/api/scanner-scan-now') {
+        // Multi-Asset Setup Diagnostic Analyzer endpoint
+        if (req.method === 'GET' && (cleanPath === '/api/analyze' || cleanPath.startsWith('/api/analyze/'))) {
+            const targetSymbol = (cleanPath.replace('/api/analyze/', '').replace('/api/analyze', '') || urlObj.searchParams.get('symbol') || 'XRPUSD').toUpperCase();
             if (activeScanner) {
-                activeScanner.scanOnce();
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ status: 'SCAN_TRIGGERED' }));
+                try {
+                    const analysis = await activeScanner.analyzeMarket(targetSymbol);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify(analysis, null, 2));
+                } catch(e) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: e.message }));
+                }
+            } else {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'SCANNER_UNAVAILABLE' }));
             }
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ error: 'NO_SCANNER' }));
         }
 
-        // Fetch Balance endpoint
-        if (req.method === 'GET' && cleanPath === '/api/balance') {
-            const balRes = await fetchDeltaBalance(config);
+        // Place Resting Zone Limit Order endpoint (Option 2)
+        if (req.method === 'POST' && cleanPath === '/api/order/limit') {
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', async () => {
+                try {
+                    const reqData = JSON.parse(body || '{}');
+                    const balRes = await fetchDeltaBalance(config);
+                    const bal = balRes.success ? balRes.available_balance : (reqData.account_balance || 0.60);
+
+                    const payload = {
+                        symbol: reqData.symbol || 'XRPUSD',
+                        side: reqData.side || 'BUY',
+                        entry_price: parseFloat(reqData.limit_price || reqData.entry_price),
+                        stop_loss: parseFloat(reqData.stop_loss),
+                        take_profit: parseFloat(reqData.take_profit),
+                        rrr: 3,
+                        size: parseInt(reqData.size || 1, 10),
+                        leverage: parseInt(reqData.leverage || 10, 10),
+                        account_balance: bal,
+                        order_type: 'limit'
+                    };
+
+                    const outcome = await handleTradeSignal(payload);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify(outcome, null, 2));
+                } catch (err) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: 'LIMIT_ORDER_ERROR', message: err.message }));
+                }
+            });
+            return;
+        }
+
+        // Live Positions endpoint
+        if (req.method === 'GET' && cleanPath === '/api/positions') {
+            const posRes = await fetchDeltaPositions(config);
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify(balRes, null, 2));
+            return res.end(JSON.stringify(posRes, null, 2));
+        }
+
+        // Live Open Orders endpoint
+        if (req.method === 'GET' && cleanPath === '/api/orders') {
+            const ordRes = await fetchDeltaOrders(config);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify(ordRes, null, 2));
+        }
+
+        // Cancel Order endpoint
+        if (req.method === 'POST' && cleanPath === '/api/order/cancel') {
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', async () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const cancelRes = await cancelDeltaOrder(config, data.order_id);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify(cancelRes, null, 2));
+                } catch(e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: e.message }));
+                }
+            });
+            return;
         }
 
         // Reset Counter endpoint
@@ -698,787 +756,595 @@ function startServer() {
             return res.end(JSON.stringify({ status: 'RESET_SUCCESS', trades_today: 0, max_trades: 3 }));
         }
 
-        // Friendly GET on /webhook
-        if (req.method === 'GET' && cleanPath === '/webhook') {
-            const limit = checkDailyLimit();
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({
-                service: 'Delta Exchange Webhook Listener',
-                status: 'ONLINE & READY',
-                instructions: 'Send a POST request with your trade JSON payload to execute an order.',
-                daily_trades_used: `${limit.tradesDone} / 3`,
-                example_payload: {
-                    symbol: 'XRPUSD',
-                    side: 'BUY',
-                    entry_price: 0.9250,
-                    stop_loss: 0.9050,
-                    rrr: 3,
-                    size: 10,
-                    order_type: 'market'
-                }
-            }, null, 2));
-        }
-
-        // Autopilot Analysis & Execution endpoint
-        if (req.method === 'POST' && cleanPath === '/api/autopilot') {
-            let body = '';
-            req.on('data', chunk => { body += chunk; });
-            req.on('end', async () => {
-                try {
-                    const reqData = JSON.parse(body || '{}');
-                    const symbol = reqData.symbol || 'XRPUSD';
-                    const riskPct = parseFloat(reqData.risk_percent || 2);
-                    const leverage = parseInt(reqData.leverage || 10);
-                    const inputBal = reqData.account_balance;
-
-                    const analysis = await runAutopilotAnalysis(symbol, config, inputBal, riskPct, leverage);
-
-                    const executionOutcome = await handleTradeSignal({
-                        symbol: analysis.symbol,
-                        side: analysis.decision,
-                        entry_price: analysis.entry_price,
-                        stop_loss: analysis.stop_loss,
-                        take_profit: analysis.take_profit,
-                        rrr: 3,
-                        size: analysis.auto_calculated_lots,
-                        leverage: leverage,
-                        account_balance: analysis.account_balance_used,
-                        order_type: 'market'
-                    });
-
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({
-                        analysis: analysis,
-                        execution: executionOutcome
-                    }, null, 2));
-                } catch (err) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'AUTOPILOT_ERROR', message: err.message }, null, 2));
-                }
-            });
-            return;
-        }
-
-        // Dashboard & Status
-        if (req.method === 'GET' && (cleanPath === '/' || cleanPath === '/status')) {
+        // Dashboard (HTML)
+        if (req.method === 'GET' && (cleanPath === '/' || cleanPath === '/index.html')) {
             const limit = checkDailyLimit();
             const state = loadTradeState();
-
-            if (hasJsonFormat) {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({
-                    service: 'Delta Exchange Bridge',
-                    utc_date: limit.todayUtc,
-                    trades_today: limit.tradesDone,
-                    max_trades: 3,
-                    remaining_trades: limit.remainingTrades,
-                    delta_environment: config.delta.environment,
-                    history: state.history || []
-                }, null, 2));
-            }
 
             const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Delta Exchange Automated Trading Console</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delta India — Institutional Trading Terminal</title>
     <style>
-        * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-        body { background: #0b0e14; color: #e2e8f0; margin: 0; padding: 24px; }
-        .container { max-width: 980px; margin: 0 auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 16px; margin-bottom: 24px; }
-        .title { font-size: 24px; font-weight: bold; color: #38bdf8; }
-        .badge { display: inline-block; padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: bold; }
-        .badge-green { background: #064e3b; color: #34d399; border: 1px solid #059669; }
-        .badge-orange { background: #7c2d12; color: #fb923c; border: 1px solid #ea580c; }
-        .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .card { background: #131b26; border: 1px solid #1e293b; border-radius: 12px; padding: 18px; }
-        .card-label { font-size: 12px; text-transform: uppercase; color: #94a3b8; margin-bottom: 6px; }
-        .card-val { font-size: 22px; font-weight: bold; }
-        .card-val.cyan { color: #38bdf8; }
-        .card-val.green { color: #4ade80; }
-        .card-val.purple { color: #c084fc; }
-        .card-val.orange { color: #fb923c; }
-        .section { background: #131b26; border: 1px solid #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 24px; }
-        .section-title { font-size: 16px; font-weight: bold; margin-bottom: 14px; color: #f1f5f9; display: flex; justify-content: space-between; align-items: center; }
-        .control-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 16px; }
-        .control-group label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 4px; text-transform: uppercase; }
-        .control-group select, .control-group input { width: 100%; background: #0f172a; border: 1px solid #334155; color: white; padding: 8px 12px; border-radius: 6px; font-size: 14px; font-weight: bold; }
-        .calc-box { background: #090d16; border: 1px solid #38bdf840; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
-        .calc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 10px; }
-        .calc-item { background: #131b26; border: 1px solid #1e293b; border-radius: 8px; padding: 10px; text-align: center; }
-        .calc-label { font-size: 11px; text-transform: uppercase; color: #94a3b8; margin-bottom: 4px; }
-        .calc-val { font-size: 16px; font-weight: bold; }
-        .safety-bar { margin-top: 12px; padding: 10px 14px; border-radius: 8px; font-size: 13px; font-weight: bold; display: flex; justify-content: space-between; align-items: center; }
-        .safety-green { background: #064e3b; color: #34d399; border: 1px solid #059669; }
-        .safety-red { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
-        .btn { background: #0284c7; color: white; border: none; padding: 10px 18px; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.2s; }
-        .btn:hover { background: #0369a1; }
-        .btn-secondary { background: #334155; }
-        .btn-secondary:hover { background: #475569; }
-        .btn-danger { background: #991b1b; }
-        .btn-danger:hover { background: #b91c1c; }
-        table { width: 100%; border-collapse: collapse; font-size: 14px; }
-        th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #1e293b; }
-        th { color: #94a3b8; font-size: 12px; text-transform: uppercase; }
-        .console { background: #05080f; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; font-family: monospace; font-size: 13px; color: #7dd3fc; max-height: 250px; overflow-y: auto; white-space: pre-wrap; }
+        :root {
+            --bg-base: #080b12;
+            --bg-card: #0f1523;
+            --bg-surface: #151d30;
+            --border-subtle: #1e293b;
+            --border-accent: #334155;
+            --text-main: #f8fafc;
+            --text-dim: #94a3b8;
+            --text-muted: #64748b;
+            --green: #10b981;
+            --green-glow: rgba(16, 185, 129, 0.15);
+            --red: #f43f5e;
+            --red-glow: rgba(244, 63, 94, 0.15);
+            --cyan: #38bdf8;
+            --amber: #f59e0b;
+            --purple: #a855f7;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }
+        body { background: var(--bg-base); color: var(--text-main); min-height: 100vh; padding-bottom: 40px; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+        /* Auth Modal Lock */
+        #auth-modal { position: fixed; inset: 0; background: rgba(8, 11, 18, 0.94); backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center; z-index: 9999; }
+        .auth-card { background: var(--bg-card); border: 1px solid var(--border-accent); border-radius: 12px; padding: 32px; width: 380px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5); text-align: center; }
+        .auth-input { width: 100%; background: var(--bg-surface); border: 1px solid var(--border-accent); border-radius: 8px; color: white; padding: 12px; font-size: 16px; margin: 18px 0; text-align: center; letter-spacing: 2px; }
+        .btn-unlock { width: 100%; background: #2563eb; color: white; border: none; padding: 12px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: 0.15s; }
+        .btn-unlock:hover { background: #1d4ed8; }
+
+        /* Header Navigation */
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-subtle); padding-bottom: 16px; margin-bottom: 24px; flex-wrap: wrap; gap: 14px; }
+        .brand-title { font-size: 20px; font-weight: 700; color: #f8fafc; letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; }
+        .badge-live { background: #064e3b; color: #34d399; border: 1px solid #059669; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+        .header-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .pill-stat { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 6px 14px; font-size: 13px; font-weight: 500; }
+        .pill-stat span { color: var(--text-dim); }
+
+        /* Symbol Switcher Tabs */
+        .symbol-tabs { display: flex; gap: 8px; margin-bottom: 20px; overflow-x: auto; }
+        .tab-btn { background: var(--bg-card); border: 1px solid var(--border-subtle); color: var(--text-dim); padding: 8px 18px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: 0.15s; }
+        .tab-btn:hover { border-color: var(--border-accent); color: var(--text-main); }
+        .tab-btn.active { background: var(--bg-surface); border-color: #38bdf8; color: #38bdf8; }
+
+        /* Setup Diagnostics Card */
+        .setup-card { background: var(--bg-card); border: 1px solid var(--border-accent); border-radius: 12px; padding: 22px; margin-bottom: 24px; }
+        .setup-top { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+        .setup-title { font-size: 16px; font-weight: 700; color: #f8fafc; display: flex; align-items: center; gap: 8px; }
+        .setup-badge { padding: 4px 12px; border-radius: 6px; font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
+
+        /* Price Gauge Ladder */
+        .price-gauge { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 16px 0; }
+        .gauge-item { background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px; }
+        .gauge-label { font-size: 11px; text-transform: uppercase; color: var(--text-dim); margin-bottom: 4px; font-weight: 600; }
+        .gauge-val { font-size: 18px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+
+        /* Diagnostic Explanation Box */
+        .explanation-box { background: var(--bg-surface); border-left: 4px solid #38bdf8; padding: 16px; border-radius: 0 8px 8px 0; margin-top: 16px; font-size: 14px; line-height: 1.6; color: #cbd5e1; }
+        .explanation-box strong { color: white; }
+
+        /* Two Modes Execution Section */
+        .modes-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 20px; margin-bottom: 24px; }
+        .mode-box { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: 12px; padding: 20px; display: flex; flex-direction: column; justify-content: space-between; }
+        .mode-box.active-mode { border-color: var(--green); }
+        .mode-header { font-size: 15px; font-weight: 700; color: #f8fafc; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; }
+        .mode-desc { font-size: 13px; color: var(--text-dim); line-height: 1.5; margin-bottom: 16px; }
+
+        .btn { padding: 10px 18px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: 1px solid transparent; transition: 0.15s; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+        .btn-primary { background: #059669; color: white; border-color: #10b981; }
+        .btn-primary:hover { background: #047857; }
+        .btn-secondary { background: var(--bg-surface); border-color: var(--border-accent); color: var(--text-main); }
+        .btn-secondary:hover { border-color: #64748b; }
+        .btn-blue { background: #2563eb; color: white; border-color: #3b82f6; width: 100%; }
+        .btn-blue:hover { background: #1d4ed8; }
+        .btn-danger { background: #991b1b; color: white; border-color: #ef4444; }
+
+        /* Tables */
+        .section-table { background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: 12px; padding: 20px; margin-bottom: 24px; }
+        .section-header { font-size: 15px; font-weight: 700; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+        th { color: var(--text-dim); font-size: 11px; text-transform: uppercase; padding: 10px 12px; border-bottom: 1px solid var(--border-subtle); font-weight: 600; }
+        td { padding: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); font-family: 'JetBrains Mono', monospace; font-size: 12.5px; }
+
+        /* Monospace Logs */
+        .console-feed { background: #06090f; border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #a7f3d0; max-height: 120px; overflow-y: auto; line-height: 1.6; }
     </style>
 </head>
 <body>
+
+    <!-- Access PIN Lock Overlay -->
+    <div id="auth-modal" style="display: none;">
+        <div class="auth-card">
+            <div style="font-size: 28px; margin-bottom: 8px;">🔒</div>
+            <div style="font-size: 18px; font-weight: 700; color: white;">Delta Terminal Protected</div>
+            <p style="font-size: 12px; color: var(--text-dim); margin-top: 6px;">Private access only. Enter your security PIN to unlock.</p>
+            <input type="password" id="input-pin" class="auth-input" placeholder="Enter Access PIN" onkeydown="if(event.key==='Enter') submitPin()">
+            <div id="pin-error" style="color: var(--red); font-size: 12px; margin-bottom: 10px; display: none;">Incorrect PIN</div>
+            <button class="btn-unlock" onclick="submitPin()">Unlock Terminal</button>
+        </div>
+    </div>
+
     <div class="container">
+        <!-- Header -->
         <div class="header">
             <div>
-                <div class="title">⚡ Delta Exchange Trading & Position Sizing Console</div>
-                <small style="color: #64748b;">LIVE INDIA | 1:3 RRR | Risk-Based Lot Sizer | Pre-Trade Margin Safety</small>
+                <div class="brand-title">
+                    <span>⚡ DELTA EXCHANGE INDIA</span>
+                    <span class="badge-live">LIVE INSTITUTIONAL</span>
+                </div>
+                <small style="color: var(--text-muted); font-size: 12px;">24/7 Supply & Demand Flow Terminal • Strict 1:3 RRR • Margin Safety Buffer</small>
             </div>
-            <div>
-                <span class="badge ${limit.tradesDone >= 3 ? 'badge-orange' : 'badge-green'}" id="status-badge">
-                    ${limit.tradesDone >= 3 ? 'STANDBY (00:00 UTC)' : 'SYSTEM ACTIVE'}
-                </span>
-            </div>
-        </div>
-
-        <div class="cards">
-            <div class="card">
-                <div class="card-label">Daily Trades (UTC)</div>
-                <div class="card-val ${limit.tradesDone >= 3 ? 'purple' : 'green'}" id="daily-count">${limit.tradesDone} / 3</div>
-                <small style="color: #64748b;">Resets 00:00:00 UTC</small>
-            </div>
-            <div class="card">
-                <div class="card-label">Risk-to-Reward</div>
-                <div class="card-val cyan">1:3 RRR</div>
-                <small style="color: #64748b;">Strict Bracket Target</small>
-            </div>
-            <div class="card">
-                <div class="card-label">Forex Factory News</div>
-                <div class="card-val green">CLEAR</div>
-                <small style="color: #64748b;">No high-impact USD events</small>
-            </div>
-            <div class="card">
-                <div class="card-label">Environment</div>
-                <div class="card-val orange">${config.delta.environment.toUpperCase()}</div>
-                <small style="color: #64748b;">Auto-Execute: ${config.delta.auto_execute ? 'LIVE ACTIVE' : 'DRY RUN'}</small>
+            <div class="header-meta">
+                <div class="pill-stat">
+                    <span>Wallet Balance: </span>
+                    <strong id="header-balance" style="color: #38bdf8;">Loading...</strong>
+                </div>
+                <div class="pill-stat">
+                    <span>Daily Budget: </span>
+                    <strong id="header-trades">${limit.tradesDone} / 3 Trades</strong>
+                </div>
+                <button class="btn btn-secondary" onclick="logout()" style="padding: 6px 12px; font-size: 12px;">🔒 Lock</button>
             </div>
         </div>
 
-        <!-- 24/7 Cloud Background Candle Scanner Box (Option 2) -->
-        <div style="background: linear-gradient(135deg, #022c22 0%, #0f172a 100%); border: 2px solid #10b981; border-radius: 12px; padding: 22px; margin-bottom: 24px; box-shadow: 0 10px 25px -5px rgba(16, 185, 129, 0.2);">
-            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+        <!-- Symbol Selector Pills -->
+        <div class="symbol-tabs">
+            <button class="tab-btn active" onclick="selectSymbol('XRPUSD', this)">Ripple (XRPUSD)</button>
+            <button class="tab-btn" onclick="selectSymbol('BTCUSD', this)">Bitcoin (BTCUSD)</button>
+            <button class="tab-btn" onclick="selectSymbol('ETHUSD', this)">Ethereum (ETHUSD)</button>
+            <button class="tab-btn" onclick="selectSymbol('SOLUSD', this)">Solana (SOLUSD)</button>
+        </div>
+
+        <!-- Setup Diagnostics Card -->
+        <div class="setup-card">
+            <div class="setup-top">
+                <div class="setup-title">
+                    <span id="active-symbol-badge" style="color: #38bdf8;">XRPUSD</span>
+                    <span>Institutional Flow Diagnostic</span>
+                </div>
+                <div id="setup-status-badge" class="setup-badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid #f59e0b;">
+                    ANALYZING MARKET...
+                </div>
+            </div>
+
+            <!-- Price Ladder -->
+            <div class="price-gauge">
+                <div class="gauge-item">
+                    <div class="gauge-label">Live 15M Price</div>
+                    <div class="gauge-val" id="metric-live-price" style="color: white;">-</div>
+                </div>
+                <div class="gauge-item">
+                    <div class="gauge-label">4H Macro Trend</div>
+                    <div class="gauge-val" id="metric-trend" style="color: var(--green);">-</div>
+                    <small id="metric-ema" style="color: var(--text-dim); font-size: 11px;">EMA: -</small>
+                </div>
+                <div class="gauge-item">
+                    <div class="gauge-label" id="metric-zone-label">Target Zone Entry</div>
+                    <div class="gauge-val" id="metric-zone-entry" style="color: #38bdf8;">-</div>
+                    <small id="metric-dist" style="color: var(--text-dim); font-size: 11px;">Distance: -</small>
+                </div>
+                <div class="gauge-item">
+                    <div class="gauge-label">Stop-Loss (1R)</div>
+                    <div class="gauge-val" id="metric-sl" style="color: var(--red);">-</div>
+                    <small id="metric-risk-dist" style="color: var(--text-dim); font-size: 11px;">Risk: -</small>
+                </div>
+                <div class="gauge-item">
+                    <div class="gauge-label">Take-Profit (3R)</div>
+                    <div class="gauge-val" id="metric-tp" style="color: var(--green);">-</div>
+                    <small style="color: var(--text-dim); font-size: 11px;">Target: Strict 1:3</small>
+                </div>
+            </div>
+
+            <!-- Plain-Language Why/Why-Not Setup Explanation -->
+            <div class="explanation-box" id="diagnostic-explanation">
+                Loading market diagnostics...
+            </div>
+        </div>
+
+        <!-- Two Clear Execution Choices -->
+        <div class="modes-grid">
+            <!-- Option 1: 24/7 Automated Candle Scanner -->
+            <div class="mode-box active-mode">
                 <div>
-                    <div style="font-size: 20px; font-weight: bold; color: #6ee7b7; display: flex; align-items: center; gap: 8px;">
-                        <span id="scanner-status-pulse">🟢</span>
-                        <span>24/7 Cloud Strategy Scanner (Option 2)</span>
-                        <span id="scanner-badge" style="font-size: 11px; background: #059669; color: white; padding: 2px 8px; border-radius: 99px;">ACTIVE & WAITING FOR SETUP</span>
+                    <div class="mode-header">
+                        <span>🟢 Option 1: 24/7 Cloud Background Candle Scanner</span>
+                        <span id="scanner-state-pill" style="font-size: 11px; background: #064e3b; color: #34d399; padding: 2px 8px; border-radius: 999px;">RUNNING</span>
                     </div>
-                    <div id="scanner-subtitle" style="color: #94a3b8; font-size: 13px; margin-top: 4px;">
-                        🛡️ <strong>Hands-Free Automated Mode:</strong> Continuously evaluating 15M candle closes. It <em>only</em> executes when price retests the zone. <strong>No clicking required!</strong>
-                    </div>
+                    <p class="mode-desc">
+                        Monitors closed 15-minute candles 24/7 in the cloud. It <strong>waits quietly</strong> until a candle closes touching the zone. When touched, it automatically executes a 1:3 bracket trade sized to your balance. <strong>Your PC can stay OFF.</strong>
+                    </p>
                 </div>
                 <div style="display: flex; gap: 10px;">
-                    <button class="btn" id="btn-scanner-toggle" onclick="toggleScanner()" style="background: #047857; font-size: 14px; padding: 10px 18px; border: 1px solid #34d399;">
-                        ⏸️ Pause Scanner
-                    </button>
-                    <button class="btn btn-secondary" onclick="fetchScannerStatus(true)" style="font-size: 14px; padding: 10px 14px;">
-                        🔄 Refresh Scan
-                    </button>
+                    <button class="btn btn-secondary" id="btn-toggle-scanner" onclick="toggleScanner()">⏸️ Pause Scanner</button>
+                    <button class="btn btn-secondary" onclick="loadMarketAnalysis(currentSymbol)">🔄 Refresh Diagnostics</button>
                 </div>
             </div>
 
-            <!-- Real-time metrics grid -->
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 16px;">
-                <div style="background: #064e3b40; border: 1px solid #05966960; border-radius: 8px; padding: 12px;">
-                    <div style="font-size: 11px; color: #a7f3d0; text-transform: uppercase;">4H Macro Trend</div>
-                    <div id="scanner-trend-val" style="font-size: 16px; font-weight: bold; color: #34d399; margin-top: 2px;">🟢 BULLISH (Longs Only)</div>
-                    <small id="scanner-ema-val" style="color: #6ee7b7; font-size: 11px;">4H EMA: Fetching...</small>
-                </div>
-                <div style="background: #064e3b40; border: 1px solid #05966960; border-radius: 8px; padding: 12px;">
-                    <div style="font-size: 11px; color: #a7f3d0; text-transform: uppercase;">Target Zone Floor/Ceiling</div>
-                    <div id="scanner-zone-val" style="font-size: 16px; font-weight: bold; color: #38bdf8; margin-top: 2px;">Scanning...</div>
-                    <small id="scanner-dist-val" style="color: #7dd3fc; font-size: 11px;">Distance: -</small>
-                </div>
-                <div style="background: #064e3b40; border: 1px solid #05966960; border-radius: 8px; padding: 12px;">
-                    <div style="font-size: 11px; color: #a7f3d0; text-transform: uppercase;">Execution Trigger</div>
-                    <div id="scanner-trigger-val" style="font-size: 15px; font-weight: bold; color: #fde047; margin-top: 2px;">Wait for 15M Retest</div>
-                    <small style="color: #cbd5e1; font-size: 11px;">Auto 1:3 RRR + ₹51 Sizing</small>
-                </div>
-                <div style="background: #064e3b40; border: 1px solid #05966960; border-radius: 8px; padding: 12px;">
-                    <div style="font-size: 11px; color: #a7f3d0; text-transform: uppercase;">Candle Check Timing</div>
-                    <div id="scanner-next-check" style="font-size: 16px; font-weight: bold; color: #f1f5f9; margin-top: 2px;">Every 60s</div>
-                    <small id="scanner-last-scan" style="color: #94a3b8; font-size: 11px;">Last: Standing by</small>
-                </div>
-            </div>
-
-            <!-- Scanner Activity Feed -->
-            <div style="margin-top: 14px;">
-                <div style="font-size: 12px; font-weight: bold; color: #6ee7b7; margin-bottom: 6px;">Live 24/7 Cloud Feed:</div>
-                <div id="scanner-log-feed" style="background: #021a14; border: 1px solid #064e3b; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 12px; color: #a7f3d0; max-height: 110px; overflow-y: auto;">
-                    Connecting to cloud scanner...
-                </div>
-            </div>
-        </div>
-
-        <!-- Optional Manual Instant Trade Box -->
-        <div style="background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%); border: 1px solid #4338ca; border-radius: 12px; padding: 20px; margin-bottom: 24px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+            <!-- Option 2: Place Resting Zone Limit Order -->
+            <div class="mode-box">
                 <div>
-                    <div style="font-size: 18px; font-weight: bold; color: #a5b4fc; display: flex; align-items: center; gap: 8px;">
-                        <span>⚡ Optional: Force Immediate Market Order (Manual)</span>
-                        <span style="font-size: 11px; background: #3730a3; color: #c7d2fe; padding: 2px 8px; border-radius: 99px;">MANUAL OVERRIDE</span>
+                    <div class="mode-header">
+                        <span>🎯 Option 2: Place Resting Zone Limit Order</span>
+                        <span style="font-size: 11px; background: #1e1b4b; color: #a5b4fc; padding: 2px 8px; border-radius: 999px;">RESTING ON DELTA</span>
                     </div>
-                    <div style="color: #94a3b8; font-size: 13px; margin-top: 4px;">
-                        ⚠️ <em>Note:</em> The 24/7 Scanner above already runs automatically and waits for candle retests. Only click this button if you want to skip the strategy wait and force an immediate trade right now.
+                    <p class="mode-desc">
+                        Instead of waiting for the candle close, places a <strong>Resting LIMIT Bracket Order</strong> directly on Delta Exchange India at the zone entry price. Does NOT execute directly! Rests on the orderbook until price reaches the zone.
+                    </p>
+                    <div style="background: var(--bg-surface); padding: 10px 14px; border-radius: 6px; font-size: 12px; margin-bottom: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                        <div>Order Type: <strong>Limit Order</strong></div>
+                        <div>Position Size: <strong id="limit-lots-preview">1 contract</strong></div>
+                        <div>Required Margin: <strong id="limit-margin-preview" style="color: #38bdf8;">~$0.097</strong></div>
+                        <div>Adaptive Leverage: <strong id="limit-lev-preview">10x</strong></div>
                     </div>
                 </div>
-                <button class="btn" onclick="triggerAutopilot()" id="btn-autopilot" style="background: #3730a3; font-size: 14px; padding: 12px 24px; border: 1px solid #6366f1;">
-                    ⚡ Force Immediate Trade (Skip Wait)
-                </button>
-            </div>
-            <div id="autopilot-card" style="display: none; background: #070a12; border: 1px solid #4338ca; border-radius: 8px; padding: 14px; margin-top: 14px;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                    <span id="auto-decision-badge" style="font-size: 15px; font-weight: bold; padding: 4px 10px; border-radius: 6px;"></span>
-                    <span id="auto-lots-badge" style="font-size: 13px; color: #a5b4fc; font-weight: bold;"></span>
-                </div>
-                <div id="auto-reasoning-text" style="color: #cbd5e1; font-size: 13px; margin-bottom: 8px;"></div>
-                <div id="auto-targets-text" style="font-family: monospace; font-size: 12px; color: #38bdf8;"></div>
+                <button class="btn btn-blue" id="btn-place-limit" onclick="placeZoneLimitOrder()">🎯 Place Limit Order on Delta Exchange</button>
             </div>
         </div>
 
-        <div class="section">
-            <div class="section-title">
-                <span>1. Trade Parameters</span>
-                <div>
-                    <button class="btn btn-secondary" onclick="openDeltaApp()">🔗 Open Delta Exchange App</button>
-                    <button class="btn btn-danger" onclick="resetCounter()" style="margin-left: 8px;">🔄 Reset Daily Count</button>
-                </div>
+        <!-- Active Open Positions Table -->
+        <div class="section-table">
+            <div class="section-header">
+                <span>Active Positions on Delta Exchange India</span>
+                <button class="btn btn-secondary" onclick="refreshPositionsAndOrders()" style="font-size: 11px; padding: 4px 10px;">🔄 Refresh</button>
             </div>
-
-            <div class="control-row">
-                <div class="control-group">
-                    <label>Crypto Asset</label>
-                    <select id="asset-select" onchange="onAssetChange()">
-                        <option value="XRPUSD" selected>XRPUSD (Ripple)</option>
-                        <option value="BTCUSD">BTCUSD (Bitcoin)</option>
-                        <option value="ETHUSD">ETHUSD (Ethereum)</option>
-                        <option value="SOLUSD">SOLUSD (Solana)</option>
-                    </select>
-                </div>
-                <div class="control-group">
-                    <label>Side</label>
-                    <select id="side-select" onchange="recalculateAll()">
-                        <option value="BUY" selected>BUY (LONG)</option>
-                        <option value="SELL">SELL (SHORT)</option>
-                    </select>
-                </div>
-                <div class="control-group">
-                    <label>Entry Price ($)</label>
-                    <input type="number" step="any" id="entry-price" value="0.9250" oninput="recalculateAll()">
-                </div>
-                <div class="control-group">
-                    <label>Stop Loss (1R) ($)</label>
-                    <input type="number" step="any" id="stop-loss" value="0.9050" oninput="recalculateAll()">
-                </div>
-                <div class="control-group">
-                    <label>Take Profit (3R) ($)</label>
-                    <input type="number" step="any" id="take-profit" value="0.9850" readonly style="color: #4ade80;">
-                </div>
-                <div class="control-group">
-                    <label>Leverage</label>
-                    <select id="leverage-select" onchange="recalculateAll()">
-                        <option value="5">5x</option>
-                        <option value="10" selected>10x</option>
-                        <option value="20">20x</option>
-                        <option value="50">50x</option>
-                    </select>
-                </div>
-            </div>
-
-            <!-- Position Sizer & Balance Safety Section -->
-            <div class="calc-box">
-                <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1e293b; padding-bottom: 8px;">
-                    <span style="font-weight: bold; color: #38bdf8;">🧮 2. Risk Sizer & Margin Safety Gate</span>
-                    <span style="font-size: 12px; color: #94a3b8;" id="contract-mult-label">1 Contract = 1 XRP</span>
-                </div>
-
-                <div class="control-row" style="margin-top: 12px; margin-bottom: 8px;">
-                    <div class="control-group">
-                        <label style="display: flex; justify-content: space-between; align-items: center;">
-                            <span>Your Account Balance ($)</span>
-                            <span id="live-bal-pill" style="color: #34d399; font-weight: bold; font-size: 11px; display: none;"></span>
-                        </label>
-                        <input type="number" id="account-balance" value="0.60" oninput="recalculateAll()">
-                    </div>
-                    <div class="control-group">
-                        <label>Max Risk % per Trade</label>
-                        <select id="risk-percent" onchange="autoCalculateLots()">
-                            <option value="1">1% Risk (Conservative)</option>
-                            <option value="2" selected>2% Risk (Standard)</option>
-                            <option value="3">3% Risk (Moderate)</option>
-                            <option value="5">5% Risk (Aggressive)</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
-                        <label>Contract Lots to Trade</label>
-                        <input type="number" id="trade-size" value="10" oninput="recalculateAll()">
-                    </div>
-                    <div class="control-group" style="display: flex; align-items: flex-end;">
-                        <button class="btn btn-secondary" onclick="autoCalculateLots()" style="width: 100%; height: 38px;">🎯 Auto-Size Lots</button>
-                    </div>
-                </div>
-
-                <div class="calc-grid">
-                    <div class="calc-item">
-                        <div class="calc-label">Order Notional</div>
-                        <div class="calc-val cyan" id="calc-notional">$9.25</div>
-                    </div>
-                    <div class="calc-item">
-                        <div class="calc-label">Required Margin</div>
-                        <div class="calc-val purple" id="calc-margin">$0.93</div>
-                    </div>
-                    <div class="calc-item">
-                        <div class="calc-label">Max 1R Loss (If SL hit)</div>
-                        <div class="calc-val" id="calc-loss" style="color: #f87171;">-$0.20</div>
-                    </div>
-                    <div class="calc-item">
-                        <div class="calc-label">Target 3R Profit (If TP hit)</div>
-                        <div class="calc-val green" id="calc-profit">+$0.60</div>
-                    </div>
-                </div>
-
-                <div class="safety-bar safety-green" id="safety-banner">
-                    <span id="safety-text">🟢 SUFFICIENT BALANCE: Required margin ($0.93) is safe (0.93% of balance).</span>
-                    <span id="buffer-text">Buffer: 99.07% free</span>
-                </div>
-            </div>
-
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 14px;">
-                <label style="font-size: 13px; color: #94a3b8; cursor: pointer;">
-                    <input type="checkbox" id="auto-open-tab" checked> Automatically open Delta Exchange web chart on execution
-                </label>
-                <button class="btn" id="btn-trigger" onclick="triggerTrade()" style="font-size: 15px; padding: 12px 28px;">⚡ Execute 1:3 Trade on Delta</button>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-title">Recent Executed Trades</div>
             <table>
                 <thead>
                     <tr>
-                        <th>Time (UTC)</th>
                         <th>Symbol</th>
                         <th>Side</th>
-                        <th>Entry</th>
-                        <th>Stop Loss (1R)</th>
-                        <th>Take Profit (3R)</th>
-                        <th>Ratio</th>
+                        <th>Size</th>
+                        <th>Entry Price</th>
+                        <th>Mark Price</th>
+                        <th>Margin</th>
+                        <th>Unrealized PnL</th>
+                        <th>Liquidation</th>
                     </tr>
                 </thead>
-                <tbody id="trade-history">
-                    ${(state.history && state.history.length > 0) ? state.history.slice(-5).reverse().map(t => `
-                        <tr>
-                            <td>${t.timestamp_utc ? t.timestamp_utc.slice(11, 19) : '-'}</td>
-                            <td><strong>${t.symbol}</strong></td>
-                            <td style="color: ${t.side === 'BUY' ? '#4ade80' : '#f87171'}">${t.side}</td>
-                            <td>$${t.entry_price}</td>
-                            <td style="color: #f87171;">$${t.stop_loss}</td>
-                            <td style="color: #4ade80;">$${t.take_profit}</td>
-                            <td>${t.rrr}</td>
-                        </tr>
-                    `).join('') : '<tr><td colspan="7" style="text-align: center; color: #64748b;">No trades executed yet today. Ready for signal.</td></tr>'}
+                <tbody id="positions-body">
+                    <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No open positions active.</td></tr>
                 </tbody>
             </table>
         </div>
 
-        <div class="section">
-            <div class="section-title">Live Execution Console & Delta Response</div>
-            <div class="console" id="log-output">[Delta Bridge] Ready on LIVE INDIA. Position Sizer & Margin Safety active. Choose asset and click Execute.</div>
+        <!-- Resting Pending Orders Table -->
+        <div class="section-table">
+            <div class="section-header">
+                <span>Resting Orders on Delta Exchange Orderbook</span>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Symbol</th>
+                        <th>Type</th>
+                        <th>Side</th>
+                        <th>Limit Price</th>
+                        <th>Size</th>
+                        <th>Stop Loss</th>
+                        <th>Take Profit</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="orders-body">
+                    <tr><td colspan="9" style="text-align: center; color: var(--text-muted);">No resting limit orders on book.</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- 24/7 Scanner Audit Feed -->
+        <div class="section-table">
+            <div class="section-header">
+                <span>Live 24/7 Cloud Candle Evaluation Feed</span>
+            </div>
+            <div class="console-feed" id="scanner-audit-feed">
+                Initializing real-time candle stream...
+            </div>
         </div>
     </div>
 
     <script>
-        const multipliers = {
-            'XRPUSD': 1.0,
-            'BTCUSD': 0.001,
-            'ETHUSD': 0.01,
-            'SOLUSD': 0.1
-        };
+        let currentSymbol = 'XRPUSD';
+        let currentAnalysis = null;
+        let authToken = localStorage.getItem('delta_access_token') || '';
 
-        const presets = {
-            'XRPUSD': { entry: 0.9250, sl: 0.9050, multLabel: '1 Contract = 1 XRP' },
-            'BTCUSD': { entry: 60900, sl: 60200, multLabel: '1 Contract = 0.001 BTC (~$60.90)' },
-            'ETHUSD': { entry: 3450, sl: 3380, multLabel: '1 Contract = 0.01 ETH (~$34.50)' },
-            'SOLUSD': { entry: 185, sl: 180, multLabel: '1 Contract = 0.1 SOL (~$18.50)' }
-        };
-
-        function onAssetChange() {
-            const asset = document.getElementById('asset-select').value;
-            const p = presets[asset] || presets['XRPUSD'];
-            document.getElementById('entry-price').value = p.entry;
-            document.getElementById('stop-loss').value = p.sl;
-            document.getElementById('contract-mult-label').textContent = p.multLabel;
-            autoCalculateLots();
-        }
-
-        function autoCalculateLots() {
-            const asset = document.getElementById('asset-select').value;
-            const entry = parseFloat(document.getElementById('entry-price').value);
-            const sl = parseFloat(document.getElementById('stop-loss').value);
-            const balance = parseFloat(document.getElementById('account-balance').value) || 100;
-            const riskPct = parseFloat(document.getElementById('risk-percent').value) || 2;
-            const mult = multipliers[asset] || 1.0;
-
-            const riskPerUnit = Math.abs(entry - sl) * mult;
-            const targetDollarRisk = (balance * (riskPct / 100));
-
-            if (riskPerUnit > 0) {
-                let calculatedLots = Math.floor(targetDollarRisk / riskPerUnit);
-                if (calculatedLots < 1) calculatedLots = 1;
-                document.getElementById('trade-size').value = calculatedLots;
-            }
-            recalculateAll();
-        }
-
-        function recalculateAll() {
-            const asset = document.getElementById('asset-select').value;
-            const side = document.getElementById('side-select').value;
-            const entry = parseFloat(document.getElementById('entry-price').value);
-            const sl = parseFloat(document.getElementById('stop-loss').value);
-            const lots = parseInt(document.getElementById('trade-size').value) || 1;
-            const leverage = parseInt(document.getElementById('leverage-select').value) || 10;
-            const balance = parseFloat(document.getElementById('account-balance').value) || 100;
-            const mult = multipliers[asset] || 1.0;
-
-            if (isNaN(entry) || isNaN(sl)) return;
-
-            // Recalculate 1:3 Take Profit
-            let tp = 0;
-            const riskDistance = Math.abs(entry - sl);
-            if (side === 'BUY') {
-                tp = entry + (riskDistance * 3);
+        // Security PIN Gate
+        function checkAuth() {
+            if (!authToken) {
+                document.getElementById('auth-modal').style.display = 'flex';
+                document.getElementById('input-pin').focus();
             } else {
-                tp = entry - (riskDistance * 3);
-            }
-            document.getElementById('take-profit').value = tp.toFixed(4);
-
-            // Calculate Notional, Margin, 1R Risk, 3R Reward
-            const notional = lots * entry * mult;
-            // Dynamic Adaptive Leverage Calculation if capital is low
-            let effectiveLeverage = leverage;
-            let isAdaptive = false;
-            if (balance > 0 && (notional / leverage) > (balance * 0.4)) {
-                const neededLev = Math.ceil(notional / (balance * 0.35));
-                const tiers = [10, 15, 20, 25, 30, 40, 50, 75, 100];
-                for (const t of tiers) {
-                    if (t >= neededLev) {
-                        effectiveLeverage = Math.min(t, 100);
-                        break;
-                    }
-                }
-                if (effectiveLeverage > leverage) {
-                    isAdaptive = true;
-                }
-            }
-
-            const reqMargin = notional / effectiveLeverage;
-            const dollarLoss = lots * riskDistance * mult;
-            const dollarProfit = lots * (riskDistance * 3) * mult;
-
-            document.getElementById('calc-notional').textContent = '$' + notional.toFixed(2);
-            document.getElementById('calc-margin').textContent = '$' + reqMargin.toFixed(2) + (isAdaptive ? ' (' + effectiveLeverage + 'x Adaptive)' : '');
-            document.getElementById('calc-loss').textContent = '-$' + dollarLoss.toFixed(2) + ' (' + ((dollarLoss / balance) * 100).toFixed(1) + '%)';
-            document.getElementById('calc-profit').textContent = '+$' + dollarProfit.toFixed(2);
-
-            // Safety Margin Check with Adaptive Leverage Awareness
-            const banner = document.getElementById('safety-banner');
-            const safetyText = document.getElementById('safety-text');
-            const bufferText = document.getElementById('buffer-text');
-            const triggerBtn = document.getElementById('btn-trigger');
-
-            if (reqMargin > balance) {
-                banner.className = 'safety-bar safety-red';
-                safetyText.textContent = '🔴 CAPITAL TOO LOW: Even at ' + effectiveLeverage + 'x leverage, margin ($' + reqMargin.toFixed(2) + ') exceeds balance ($' + balance.toFixed(2) + ')!';
-                bufferText.textContent = 'Deficit: -$' + (reqMargin - balance).toFixed(2);
-                triggerBtn.disabled = true;
-                triggerBtn.style.opacity = '0.5';
-            } else if (isAdaptive) {
-                const marginUsagePct = ((reqMargin / balance) * 100).toFixed(1);
-                banner.className = 'safety-bar safety-yellow';
-                banner.style.background = 'rgba(234, 179, 8, 0.15)';
-                banner.style.border = '1px solid #eab308';
-                banner.style.color = '#fde047';
-                safetyText.textContent = '⚡ ADAPTIVE LEVERAGE ACTIVE: Capital is low ($' + balance.toFixed(2) + '). Auto-increased leverage from ' + leverage + 'x to ' + effectiveLeverage + 'x so trade fits safely!';
-                bufferText.textContent = 'Margin: $' + reqMargin.toFixed(2) + ' (' + marginUsagePct + '%) | Free: ' + (100 - marginUsagePct).toFixed(1) + '%';
-                triggerBtn.disabled = false;
-                triggerBtn.style.opacity = '1';
-            } else {
-                const marginUsagePct = ((reqMargin / balance) * 100).toFixed(1);
-                banner.className = 'safety-bar safety-green';
-                banner.style.background = 'rgba(16, 185, 129, 0.1)';
-                banner.style.border = '1px solid #10b981';
-                banner.style.color = '#34d399';
-                safetyText.textContent = '🟢 SUFFICIENT BALANCE: Margin required ($' + reqMargin.toFixed(2) + ') is ' + marginUsagePct + '% of balance.';
-                bufferText.textContent = 'Free Buffer: ' + (100 - marginUsagePct).toFixed(1) + '%';
-                triggerBtn.disabled = false;
-                triggerBtn.style.opacity = '1';
+                document.getElementById('auth-modal').style.display = 'none';
+                initDashboard();
             }
         }
 
-        async function triggerAutopilot() {
-            const btn = document.getElementById('btn-autopilot');
-            const log = document.getElementById('log-output');
-            const card = document.getElementById('autopilot-card');
-            const asset = document.getElementById('asset-select').value;
-            const balance = parseFloat(document.getElementById('account-balance').value) || 100;
-            const riskPct = parseFloat(document.getElementById('risk-percent').value) || 2;
-            const leverage = parseInt(document.getElementById('leverage-select').value) || 10;
-            const autoOpen = document.getElementById('auto-open-tab').checked;
-
-            btn.disabled = true;
-            btn.textContent = 'Analyzing & Executing...';
-            log.textContent += '\\n\\n🤖 [AUTOPILOT TRIGGERED] Running real-time market analysis on ' + asset + '...';
-
-            if (autoOpen) {
-                openDeltaApp();
-            }
-
+        async function submitPin() {
+            const pin = document.getElementById('input-pin').value.trim();
+            const errEl = document.getElementById('pin-error');
             try {
-                const res = await fetch('/api/autopilot', {
+                const res = await fetch('/api/auth/verify', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        symbol: asset,
-                        account_balance: balance,
-                        risk_percent: riskPct,
-                        leverage: leverage
-                    })
+                    body: JSON.stringify({ pin: pin })
                 });
-
                 const data = await res.json();
-                log.textContent += '\\n<<< [AUTOPILOT ANALYSIS & EXECUTION]:\\n' + JSON.stringify(data, null, 2);
-                log.scrollTop = log.scrollHeight;
-
-                if (data.analysis) {
-                    card.style.display = 'block';
-                    const an = data.analysis;
-                    const badge = document.getElementById('auto-decision-badge');
-                    badge.textContent = 'AI DECISION: ' + an.decision + ' ' + an.symbol;
-                    badge.style.background = an.decision === 'BUY' ? '#064e3b' : '#7f1d1d';
-                    badge.style.color = an.decision === 'BUY' ? '#34d399' : '#fca5a5';
-
-                    document.getElementById('auto-lots-badge').textContent = 'Auto Lots: ' + an.auto_calculated_lots + ' contracts | Margin: $' + an.required_margin_usd;
-                    document.getElementById('auto-reasoning-text').textContent = an.reasoning;
-                    document.getElementById('auto-targets-text').textContent = 'Entry: $' + an.entry_price + ' | SL (1R): $' + an.stop_loss + ' | TP (3R): $' + an.take_profit + ' | Max Risk: -$' + an.max_1r_loss_usd + ' | Target Gain: +$' + an.target_3r_profit_usd;
-
-                    document.getElementById('side-select').value = an.decision;
-                    document.getElementById('entry-price').value = an.entry_price;
-                    document.getElementById('stop-loss').value = an.stop_loss;
-                    document.getElementById('take-profit').value = an.take_profit;
-                    document.getElementById('trade-size').value = an.auto_calculated_lots;
-                    recalculateAll();
+                if (data.success) {
+                    authToken = data.token;
+                    localStorage.setItem('delta_access_token', authToken);
+                    document.getElementById('auth-modal').style.display = 'none';
+                    initDashboard();
+                } else {
+                    errEl.style.display = 'block';
                 }
-
-                if (data.execution && data.execution.verdict === 'EXECUTED') {
-                    log.textContent += '\\n\\n✅ [AUTOPILOT SUCCESS] Position placed on Delta Exchange! Order ID: ' + (data.execution.order_id || 'Submitted');
-                } else if (data.execution && data.execution.verdict === 'FAILED_ON_EXCHANGE') {
-                    log.textContent += '\\n\\n❌ [EXCHANGE REJECTED]: ' + (data.execution.reject_reason || 'Exchange rejected order');
-                    if (JSON.stringify(data).includes('ip_not_whitelisted')) {
-                        log.textContent += '\\n⚠️ Delta IP Whitelist Alert: Turn off IP Whitelist in your Delta API key settings (or add your IP address)!';
-                    }
-                }
-            } catch (err) {
-                log.textContent += '\\n<<< [AUTOPILOT NETWORK ERROR]: ' + err.message;
-            } finally {
-                btn.disabled = false;
-                btn.textContent = '🚀 RUN AUTOPILOT & TAKE POSITION';
+            } catch(e) {
+                errEl.style.display = 'block';
+                errEl.textContent = 'Connection error. Try again.';
             }
         }
 
-        function openDeltaApp() {
-            const asset = document.getElementById('asset-select').value;
-            window.open('https://india.delta.exchange/app/futures/trade/' + asset, '_blank');
+        function logout() {
+            localStorage.removeItem('delta_access_token');
+            authToken = '';
+            document.getElementById('auth-modal').style.display = 'flex';
         }
 
-        async function resetCounter() {
-            if (!confirm('Reset daily trade counter back to 0/3?')) return;
-            const res = await fetch('/reset-counter', { method: 'POST' });
-            const data = await res.json();
-            document.getElementById('daily-count').textContent = '0 / 3';
-            document.getElementById('daily-count').className = 'card-val green';
-            document.getElementById('status-badge').textContent = 'SYSTEM ACTIVE';
-            document.getElementById('status-badge').className = 'badge badge-green';
-            alert('Daily trade counter reset to 0/3!');
+        function authHeaders() {
+            return {
+                'Content-Type': 'application/json',
+                'x-access-pin': authToken,
+                'Authorization': 'Bearer ' + authToken
+            };
         }
 
-        async function triggerTrade() {
-            const btn = document.getElementById('btn-trigger');
-            const log = document.getElementById('log-output');
-            const asset = document.getElementById('asset-select').value;
-            const side = document.getElementById('side-select').value;
-            const entry = parseFloat(document.getElementById('entry-price').value);
-            const sl = parseFloat(document.getElementById('stop-loss').value);
-            const tp = parseFloat(document.getElementById('take-profit').value);
-            const size = parseInt(document.getElementById('trade-size').value);
-            const leverage = parseInt(document.getElementById('leverage-select').value);
-            const balance = parseFloat(document.getElementById('account-balance').value);
-            const autoOpen = document.getElementById('auto-open-tab').checked;
+        function selectSymbol(sym, el) {
+            currentSymbol = sym;
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            if (el) el.classList.add('active');
+            document.getElementById('active-symbol-badge').textContent = sym;
+            loadMarketAnalysis(sym);
+        }
 
-            btn.disabled = true;
-            btn.textContent = 'Executing...';
-
-            log.textContent += '\\n\\n>>> [DISPATCHING LIVE ORDER TO DELTA INDIA] ' + side + ' ' + size + ' ' + asset + ' @ $' + entry + ' (SL: $' + sl + ' | TP 1:3: $' + tp + ')';
-
-            if (autoOpen) {
-                openDeltaApp();
-            }
-
+        async function loadMarketAnalysis(sym) {
+            const expBox = document.getElementById('diagnostic-explanation');
+            expBox.innerHTML = 'Analyzing 15M candles and 4H trend structure for ' + sym + '...';
             try {
-                const res = await fetch('/webhook', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        symbol: asset,
-                        side: side,
-                        entry_price: entry,
-                        stop_loss: sl,
-                        take_profit: tp,
-                        rrr: 3,
-                        size: size,
-                        leverage: leverage,
-                        account_balance: balance,
-                        order_type: 'market'
-                    })
-                });
-
+                const res = await fetch('/api/analyze/' + sym, { headers: authHeaders() });
+                if (res.status === 401) { logout(); return; }
                 const data = await res.json();
-                log.textContent += '\\n<<< [DELTA API RESPONSE]:\\n' + JSON.stringify(data, null, 2);
-                log.scrollTop = log.scrollHeight;
-
-                if (data.verdict === 'EXECUTED') {
-                    log.textContent += '\\n\\n✅ [SUCCESS] Order confirmed on Delta Exchange! Check your open position!';
-                } else if (data.verdict === 'FAILED_ON_EXCHANGE') {
-                    log.textContent += '\\n\\n❌ [EXCHANGE REJECTED]: ' + (data.reject_reason || 'Unknown error');
-                    if (JSON.stringify(data).includes('ip_not_whitelisted')) {
-                        log.textContent += '\\n⚠️ Delta IP Whitelist Alert: Turn off IP Whitelist in your Delta API key settings (or add your current IP address)!';
-                    }
-                } else if (data.verdict === 'REJECTED') {
-                    log.textContent += '\\n\\n🛡️ [RISK GATE REJECTED]: ' + data.reject_reason;
-                }
-            } catch (err) {
-                log.textContent += '\\n<<< [NETWORK ERROR]: ' + err.message;
-            } finally {
-                btn.disabled = false;
-                btn.textContent = '⚡ Execute 1:3 Trade on Delta';
+                currentAnalysis = data;
+                renderAnalysis(data);
+            } catch(e) {
+                expBox.textContent = 'Error fetching market analysis: ' + e.message;
             }
+        }
+
+        function renderAnalysis(data) {
+            if (!data || data.error) return;
+
+            document.getElementById('metric-live-price').textContent = '$' + data.livePrice;
+            const trendEl = document.getElementById('metric-trend');
+            trendEl.textContent = data.trend === 'BULLISH' ? '🟢 BULLISH' : '🔴 BEARISH';
+            trendEl.style.color = data.trend === 'BULLISH' ? '#10b981' : '#f43f5e';
+            document.getElementById('metric-ema').textContent = '4H EMA: $' + data.ema4h;
+
+            const badge = document.getElementById('setup-status-badge');
+            badge.textContent = data.setupStatusLabel;
+            if (data.setupStatus === 'READY_FOR_EXECUTION') {
+                badge.style.background = 'rgba(16, 185, 129, 0.2)';
+                badge.style.borderColor = '#10b981';
+                badge.style.color = '#34d399';
+            } else if (data.setupStatus === 'WAITING_FOR_RETEST') {
+                badge.style.background = 'rgba(245, 158, 11, 0.2)';
+                badge.style.borderColor = '#f59e0b';
+                badge.style.color = '#fbbf24';
+            } else {
+                badge.style.background = 'rgba(148, 163, 184, 0.15)';
+                badge.style.borderColor = '#64748b';
+                badge.style.color = '#94a3b8';
+            }
+
+            if (data.targetZone) {
+                document.getElementById('metric-zone-label').textContent = data.targetZone.type + ' Zone Entry';
+                document.getElementById('metric-zone-entry').textContent = '$' + data.targetZone.entryLimit;
+                document.getElementById('metric-dist').textContent = 'Distance: ' + data.targetZone.distancePct + '% ($' + data.targetZone.distanceUsd + ')';
+                document.getElementById('metric-sl').textContent = '$' + data.targetZone.sl;
+                document.getElementById('metric-risk-dist').textContent = 'Risk 1R: $' + data.targetZone.riskDist;
+                document.getElementById('metric-tp').textContent = '$' + data.targetZone.tp;
+
+                document.getElementById('btn-place-limit').disabled = false;
+                document.getElementById('btn-place-limit').textContent = '🎯 Place Limit Order @ $' + data.targetZone.entryLimit + ' on Delta';
+            } else {
+                document.getElementById('metric-zone-label').textContent = 'Target Zone Entry';
+                document.getElementById('metric-zone-entry').textContent = 'None Detected';
+                document.getElementById('metric-dist').textContent = 'Consolidating';
+                document.getElementById('metric-sl').textContent = '-';
+                document.getElementById('metric-risk-dist').textContent = '-';
+                document.getElementById('metric-tp').textContent = '-';
+
+                document.getElementById('btn-place-limit').disabled = true;
+                document.getElementById('btn-place-limit').textContent = 'Waiting for Institutional Zone...';
+            }
+
+            document.getElementById('diagnostic-explanation').innerHTML = '<strong>Setup Status Reason:</strong><br>' + data.simpleExplanation;
         }
 
         async function fetchLiveBalance() {
             try {
-                const res = await fetch('/api/balance');
+                const res = await fetch('/api/balance', { headers: authHeaders() });
+                if (res.status === 401) { logout(); return; }
                 const data = await res.json();
-                if (data.success && data.available_balance > 0) {
-                    document.getElementById('account-balance').value = data.available_balance.toFixed(2);
-                    const rawUsd = data.raw && data.raw.find(b => b.asset_symbol === 'USD');
-                    const inrBal = rawUsd && rawUsd.available_balance_inr ? parseFloat(rawUsd.available_balance_inr).toFixed(2) : (data.available_balance * 85).toFixed(2);
-                    const pill = document.getElementById('live-bal-pill');
-                    pill.textContent = '🟢 Live Balance: $' + data.available_balance.toFixed(2) + ' (₹' + inrBal + ')';
-                    pill.style.display = 'inline';
-                    autoCalculateLots();
+                if (data.success) {
+                    const usd = data.available_balance.toFixed(2);
+                    const inr = data.available_balance_inr ? data.available_balance_inr.toFixed(2) : (data.available_balance * 85).toFixed(2);
+                    document.getElementById('header-balance').textContent = '$' + usd + ' (₹' + inr + ' INR)';
                 }
             } catch(e) {}
         }
 
-        async function fetchScannerStatus(triggerScan = false) {
+        async function fetchScannerStatus() {
             try {
-                if (triggerScan) {
-                    await fetch('/api/scanner-scan-now', { method: 'POST' });
-                }
-                const res = await fetch('/api/scanner-status');
+                const res = await fetch('/api/scanner-status', { headers: authHeaders() });
+                if (res.status === 401) { logout(); return; }
                 const data = await res.json();
-                
-                const pulse = document.getElementById('scanner-status-pulse');
-                const badge = document.getElementById('scanner-badge');
-                const btnToggle = document.getElementById('btn-scanner-toggle');
-                
+
+                const statePill = document.getElementById('scanner-state-pill');
+                const btnToggle = document.getElementById('btn-toggle-scanner');
+
                 if (data.running) {
-                    pulse.textContent = '🟢';
-                    badge.textContent = 'ACTIVE IN CLOUD';
-                    badge.style.background = '#059669';
+                    statePill.textContent = 'RUNNING';
+                    statePill.style.background = '#064e3b';
+                    statePill.style.color = '#34d399';
                     btnToggle.textContent = '⏸️ Pause Scanner';
-                    btnToggle.style.background = '#047857';
                 } else {
-                    pulse.textContent = '⏸️';
-                    badge.textContent = 'PAUSED';
-                    badge.style.background = '#6b7280';
+                    statePill.textContent = 'PAUSED';
+                    statePill.style.background = '#78350f';
+                    statePill.style.color = '#fbbf24';
                     btnToggle.textContent = '▶️ Resume Scanner';
-                    btnToggle.style.background = '#2563eb';
-                }
-
-                if (data.trend) {
-                    const trendEl = document.getElementById('scanner-trend-val');
-                    trendEl.textContent = data.trend === 'BULLISH' ? '🟢 BULLISH (Longs Only)' : '🔴 BEARISH (Shorts Only)';
-                    trendEl.style.color = data.trend === 'BULLISH' ? '#34d399' : '#f87171';
-                }
-
-                if (data.ema4h) {
-                    document.getElementById('scanner-ema-val').textContent = '4H EMA: $' + data.ema4h;
-                }
-
-                if (data.targetZone) {
-                    document.getElementById('scanner-zone-val').textContent = data.targetZone.type + ' @ $' + data.targetZone.entryLimit;
-                    document.getElementById('scanner-dist-val').textContent = 'Distance: ' + (data.distancePct !== null ? data.distancePct + '%' : '-') + ' (SL: $' + data.targetZone.sl + ')';
-                } else {
-                    document.getElementById('scanner-zone-val').textContent = 'Scanning fresh zones...';
-                    document.getElementById('scanner-dist-val').textContent = 'Standing by for displacement';
-                }
-
-                if (data.lastScanTime) {
-                    document.getElementById('scanner-last-scan').textContent = 'Last: ' + data.lastScanTime.slice(11, 19) + ' UTC';
                 }
 
                 if (data.logs && data.logs.length > 0) {
-                    const feed = document.getElementById('scanner-log-feed');
-                    feed.innerHTML = data.logs.map(l => '<div>' + l + '</div>').join('');
+                    document.getElementById('scanner-audit-feed').innerHTML = data.logs.map(l => '<div>' + l + '</div>').join('');
                 }
             } catch(e) {}
         }
 
         async function toggleScanner() {
             try {
-                await fetch('/api/scanner-toggle', { method: 'POST' });
-                await fetchScannerStatus();
+                await fetch('/api/scanner-toggle', { method: 'POST', headers: authHeaders() });
+                fetchScannerStatus();
             } catch(e) {}
         }
 
-        // Initialize on load
-        window.onload = function() {
-            autoCalculateLots();
+        async function placeZoneLimitOrder() {
+            if (!currentAnalysis || !currentAnalysis.targetZone) {
+                alert('No active target zone found to place limit order!');
+                return;
+            }
+
+            const z = currentAnalysis.targetZone;
+            const btn = document.getElementById('btn-place-limit');
+            btn.disabled = true;
+            btn.textContent = 'Submitting Limit Order to Delta...';
+
+            try {
+                const res = await fetch('/api/order/limit', {
+                    method: 'POST',
+                    headers: authHeaders(),
+                    body: JSON.stringify({
+                        symbol: currentSymbol,
+                        side: z.side,
+                        limit_price: z.entryLimit,
+                        stop_loss: z.sl,
+                        take_profit: z.tp,
+                        size: 1,
+                        leverage: 10
+                    })
+                });
+
+                const data = await res.json();
+                if (data.verdict === 'EXECUTED') {
+                    alert('✅ SUCCESS! Resting Limit Order placed on Delta Exchange at $' + z.entryLimit + ' (Order ID: ' + data.order_id + ')');
+                    refreshPositionsAndOrders();
+                } else {
+                    alert('Order placement response: ' + (data.reject_reason || JSON.stringify(data)));
+                }
+            } catch(e) {
+                alert('Network Error placing limit order: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🎯 Place Limit Order @ $' + z.entryLimit + ' on Delta';
+            }
+        }
+
+        async function refreshPositionsAndOrders() {
+            try {
+                const [posRes, ordRes] = await Promise.all([
+                    fetch('/api/positions', { headers: authHeaders() }).then(r => r.json()),
+                    fetch('/api/orders', { headers: authHeaders() }).then(r => r.json())
+                ]);
+
+                // Render positions
+                const posBody = document.getElementById('positions-body');
+                if (posRes.positions && posRes.positions.length > 0) {
+                    posBody.innerHTML = posRes.positions.map(p => {
+                        const sideColor = p.size > 0 ? '#10b981' : '#f43f5e';
+                        const sideLabel = p.size > 0 ? 'LONG' : 'SHORT';
+                        const pnlColor = parseFloat(p.unrealized_pnl) >= 0 ? '#10b981' : '#f43f5e';
+                        return '<tr>' +
+                            '<td><strong>' + (p.product_symbol || p.symbol) + '</strong></td>' +
+                            '<td style="color: ' + sideColor + '">' + sideLabel + '</td>' +
+                            '<td>' + p.size + '</td>' +
+                            '<td>$' + p.entry_price + '</td>' +
+                            '<td>$' + p.mark_price + '</td>' +
+                            '<td>$' + p.margin + '</td>' +
+                            '<td style="color: ' + pnlColor + '">' + p.unrealized_pnl + '</td>' +
+                            '<td>$' + (p.liquidation_price || '-') + '</td>' +
+                        '</tr>';
+                    }).join('');
+                } else {
+                    posBody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No open positions active.</td></tr>';
+                }
+
+                // Render orders
+                const ordBody = document.getElementById('orders-body');
+                if (ordRes.orders && ordRes.orders.length > 0) {
+                    ordBody.innerHTML = ordRes.orders.map(o => {
+                        const sideColor = o.side === 'buy' ? '#10b981' : '#f43f5e';
+                        const timeStr = o.created_at ? o.created_at.slice(11, 19) : '-';
+                        return '<tr>' +
+                            '<td>' + timeStr + '</td>' +
+                            '<td><strong>' + o.product_symbol + '</strong></td>' +
+                            '<td>' + o.order_type + '</td>' +
+                            '<td style="color: ' + sideColor + '">' + o.side.toUpperCase() + '</td>' +
+                            '<td>$' + (o.limit_price || o.stop_price || '-') + '</td>' +
+                            '<td>' + o.size + '</td>' +
+                            '<td>$' + (o.bracket_stop_loss_price || '-') + '</td>' +
+                            '<td>$' + (o.bracket_take_profit_price || '-') + '</td>' +
+                            '<td><button class="btn btn-danger" style="padding: 3px 8px; font-size: 11px;" onclick="cancelOrder(' + o.id + ')">Cancel</button></td>' +
+                        '</tr>';
+                    }).join('');
+                } else {
+                    ordBody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-muted);">No resting limit orders on book.</td></tr>';
+                }
+            } catch(e) {}
+        }
+
+        async function cancelOrder(orderId) {
+            if (!confirm('Cancel order #' + orderId + '?')) return;
+            try {
+                const res = await fetch('/api/order/cancel', {
+                    method: 'POST',
+                    headers: authHeaders(),
+                    body: JSON.stringify({ order_id: orderId })
+                });
+                const data = await res.json();
+                alert(data.success ? 'Order cancelled successfully.' : 'Cancellation failed.');
+                refreshPositionsAndOrders();
+            } catch(e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        function initDashboard() {
             fetchLiveBalance();
+            loadMarketAnalysis(currentSymbol);
             fetchScannerStatus();
+            refreshPositionsAndOrders();
+
             setInterval(fetchScannerStatus, 4000);
             setInterval(fetchLiveBalance, 15000);
-        };
+            setInterval(refreshPositionsAndOrders, 10000);
+        }
+
+        window.onload = checkAuth;
     </script>
 </body>
 </html>`;
             res.writeHead(200, { 'Content-Type': 'text/html' });
             return res.end(html);
-        }
-
-        // Webhook receiver
-        if (req.method === 'POST' && (cleanPath === '/webhook' || cleanPath === '/signal' || cleanPath === '/trigger-demo')) {
-            let body = '';
-            req.on('data', chunk => { body += chunk; });
-            req.on('end', async () => {
-                try {
-                    const signalData = JSON.parse(body || '{}');
-                    const outcome = await handleTradeSignal(signalData);
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify(outcome, null, 2));
-                } catch (err) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'INVALID_PAYLOAD', message: err.message }, null, 2));
-                }
-            });
-            return;
         }
 
         res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -1487,8 +1353,8 @@ function startServer() {
 
     const PORT = process.env.PORT || config.port || 5050;
     server.listen(PORT, () => {
-        console.log(`[Delta Bridge] Running on port ${PORT}`);
-        console.log(`[Delta Bridge] Webhook URL: http://localhost:${PORT}/webhook`);
+        console.log(`[Delta Bridge] Institutional Terminal running on port ${PORT}`);
+        console.log(`[Delta Bridge] Access PIN: ${config.access_pin || 'delta2026'}`);
         console.log(`[Delta Bridge] Health Check: http://localhost:${PORT}/health`);
         console.log(`[Delta Bridge] Dashboard: http://localhost:${PORT}`);
     });
@@ -1506,8 +1372,9 @@ module.exports = {
     getDeltaWebUrl,
     getContractMultiplier,
     fetchDeltaBalance,
-    fetchLiveTicker,
-    runAutopilotAnalysis
+    fetchDeltaPositions,
+    fetchDeltaOrders,
+    cancelDeltaOrder
 };
 
 if (require.main === module) {
