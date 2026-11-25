@@ -331,6 +331,10 @@ async function cancelDeltaOrder(config, orderId, productId) {
         } catch(e) {}
     }
 
+    if (!productId || Number(productId) <= 0) {
+        productId = 14969; // Default fallback to XRPUSD
+    }
+
     return new Promise((resolve) => {
         const timestamp = Math.floor(Date.now() / 1000).toString();
         const pathStr = '/v2/orders';
