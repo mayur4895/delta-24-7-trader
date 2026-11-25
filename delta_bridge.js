@@ -313,11 +313,33 @@ function fetchDeltaOrders(config) {
     });
 }
 
-function cancelDeltaOrder(config, orderId) {
+async function cancelDeltaOrder(config, orderId, productId) {
+    if (!config.delta.api_key || !config.delta.api_secret) {
+        return { success: false, error: 'MISSING_API_CREDENTIALS' };
+    }
+
+    // Auto-resolve product_id from open orders if not explicitly passed
+    if (!productId || Number(productId) <= 0) {
+        try {
+            const openOrders = await fetchDeltaOrders(config);
+            if (openOrders.success && Array.isArray(openOrders.orders)) {
+                const match = openOrders.orders.find(o => String(o.id) === String(orderId));
+                if (match && match.product_id) {
+                    productId = match.product_id;
+                }
+            }
+        } catch(e) {}
+    }
+
     return new Promise((resolve) => {
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        const pathStr = `/v2/orders/${orderId}`;
-        const signature = createDeltaSignature(config.delta.api_secret, 'DELETE', timestamp, pathStr);
+        const pathStr = '/v2/orders';
+        const payload = { id: Number(orderId) };
+        if (productId && Number(productId) > 0) {
+            payload.product_id = Number(productId);
+        }
+        const bodyStr = JSON.stringify(payload);
+        const signature = createDeltaSignature(config.delta.api_secret, 'DELETE', timestamp, pathStr, '', bodyStr);
         const host = getDeltaBaseUrl(config.delta.environment);
 
         const req = https.request({
@@ -325,11 +347,13 @@ function cancelDeltaOrder(config, orderId) {
             path: pathStr,
             method: 'DELETE',
             headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
                 'api-key': config.delta.api_key,
                 'timestamp': timestamp,
                 'signature': signature,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0'
+                'User-Agent': 'Mozilla/5.0',
+                'Content-Length': Buffer.byteLength(bodyStr)
             }
         }, (res) => {
             let data = '';
@@ -337,13 +361,25 @@ function cancelDeltaOrder(config, orderId) {
             res.on('end', () => {
                 try {
                     const parsed = JSON.parse(data);
-                    resolve({ success: true, response: parsed });
+                    if (res.statusCode >= 200 && res.statusCode < 300) {
+                        resolve({ success: true, response: parsed });
+                    } else {
+                        const errMsg = (parsed.error && (parsed.error.message || parsed.error.code)) || 
+                                       parsed.message || 
+                                       `Exchange returned HTTP ${res.statusCode}`;
+                        resolve({ success: false, http_status: res.statusCode, error: errMsg, response: parsed });
+                    }
                 } catch(e) {
-                    resolve({ success: false, error: e.message });
+                    resolve({ 
+                        success: false, 
+                        http_status: res.statusCode, 
+                        error: `Non-JSON response from Delta (HTTP ${res.statusCode}): ${data.slice(0, 120)}` 
+                    });
                 }
             });
         });
         req.on('error', (err) => resolve({ success: false, error: err.message }));
+        req.write(bodyStr);
         req.end();
     });
 }
@@ -737,12 +773,12 @@ function startServer() {
             req.on('end', async () => {
                 try {
                     const data = JSON.parse(body || '{}');
-                    const cancelRes = await cancelDeltaOrder(config, data.order_id);
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    const cancelRes = await cancelDeltaOrder(config, data.order_id, data.product_id);
+                    res.writeHead(cancelRes.success ? 200 : 400, { 'Content-Type': 'application/json' });
                     return res.end(JSON.stringify(cancelRes, null, 2));
                 } catch(e) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
-                    return res.end(JSON.stringify({ error: e.message }));
+                    return res.end(JSON.stringify({ success: false, error: e.message }));
                 }
             });
             return;
@@ -1303,7 +1339,7 @@ function startServer() {
                             '<td>' + o.size + '</td>' +
                             '<td>$' + (o.bracket_stop_loss_price || '-') + '</td>' +
                             '<td>$' + (o.bracket_take_profit_price || '-') + '</td>' +
-                            '<td><button class="btn btn-danger" style="padding: 3px 8px; font-size: 11px;" onclick="cancelOrder(' + o.id + ')">Cancel</button></td>' +
+                            '<td><button class="btn btn-danger" style="padding: 3px 8px; font-size: 11px;" onclick="cancelOrder(' + o.id + ', ' + (o.product_id || 0) + ')">Cancel</button></td>' +
                         '</tr>';
                     }).join('');
                 } else {
@@ -1312,16 +1348,20 @@ function startServer() {
             } catch(e) {}
         }
 
-        async function cancelOrder(orderId) {
+        async function cancelOrder(orderId, productId) {
             if (!confirm('Cancel order #' + orderId + '?')) return;
             try {
                 const res = await fetch('/api/order/cancel', {
                     method: 'POST',
                     headers: authHeaders(),
-                    body: JSON.stringify({ order_id: orderId })
+                    body: JSON.stringify({ order_id: orderId, product_id: productId })
                 });
                 const data = await res.json();
-                alert(data.success ? 'Order cancelled successfully.' : 'Cancellation failed.');
+                if (data.success) {
+                    alert('Order #' + orderId + ' cancelled successfully.');
+                } else {
+                    alert('Cancellation failed: ' + (data.error || 'Check exchange response'));
+                }
                 refreshPositionsAndOrders();
             } catch(e) {
                 alert('Error: ' + e.message);
