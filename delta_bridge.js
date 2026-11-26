@@ -1126,7 +1126,7 @@ function startServer() {
 <body>
 
     <!-- 2-Step Authentication Overlay (2FA First, then Master Password) -->
-    <div id="auth-modal" style="display: none;">
+    <div id="auth-modal" style="display: flex;">
         <div class="auth-card" style="width: 420px; text-align: left;">
             <!-- Step 1: 2FA Verification -->
             <div id="auth-step-1">
@@ -1235,7 +1235,8 @@ function startServer() {
         </div>
     </div>
 
-    <div class="container">
+    <!-- Main Terminal Dashboard (Displayed for Owner Only after 2FA + Password) -->
+    <div class="container" id="terminal-app" style="display: none;">
         <!-- Header -->
         <div class="header">
             <div>
@@ -1469,10 +1470,14 @@ function startServer() {
         async function checkAuth() {
             const now = Date.now();
             if (!sessionToken || (sessionExpiry > 0 && now > sessionExpiry)) {
+                const app = document.getElementById('terminal-app');
+                if (app) app.style.display = 'none';
                 showAuthStep1();
                 fetchTotpHint();
             } else {
                 document.getElementById('auth-modal').style.display = 'none';
+                const app = document.getElementById('terminal-app');
+                if (app) app.style.display = 'block';
                 start30MinSessionTimer();
                 initDashboard();
             }
@@ -1529,7 +1534,7 @@ function startServer() {
         function copy2FASecret() {
             const sec = document.getElementById('totp-secret-display').textContent.trim();
             navigator.clipboard.writeText(sec);
-            alert('2FA Secret Key copied: ' + sec + '\nPaste this key into Google Authenticator or Microsoft Authenticator!');
+            alert('2FA Secret Key copied: ' + sec);
         }
 
         // Submit Step 1: 2FA Code
@@ -1602,6 +1607,8 @@ function startServer() {
                     localStorage.setItem('delta_session_expiry', String(sessionExpiry));
 
                     document.getElementById('auth-modal').style.display = 'none';
+                    const app = document.getElementById('terminal-app');
+                    if (app) app.style.display = 'block';
                     start30MinSessionTimer();
                     initDashboard();
                 } else {
@@ -1640,6 +1647,8 @@ function startServer() {
             pendingTempToken = '';
             if (sessionTimer) clearInterval(sessionTimer);
 
+            const app = document.getElementById('terminal-app');
+            if (app) app.style.display = 'none';
             showAuthStep1();
             if (reason) {
                 const err = document.getElementById('2fa-error');
