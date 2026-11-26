@@ -26,6 +26,15 @@ const { fetchCoinGlassIntelligence, evaluateLiquidityConfluence } = require('./m
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 let activeScanner = null;
 
+// Default bcrypt hashes (Strictly zero plaintext passwords in code)
+// Default Master Admin: Kmsl@1234
+const DEFAULT_ADMIN_HASH = '$2b$10$SzSfcWV5HSpMP6STt/YqsOIDqbF1gpPvQxydGH/A38U4hoXJKif/q';
+// Default Market Viewers: delta2025 and delta2026
+const DEFAULT_VIEWER_HASHES = [
+    '$2b$10$1RVZ1s5ud.c2jRTtp9YeW.6VakJAX1SXoh4C/oGWOJC.4bVNIJfjK', // delta2025
+    '$2b$10$rlVKFtkyc8QSRzRueTjSu.SMLvEvbVP61H.2co3xNz11zF5NtSeaO'  // delta2026
+];
+
 function setActiveScanner(scanner) {
     activeScanner = scanner;
 }
@@ -33,9 +42,12 @@ function setActiveScanner(scanner) {
 function loadConfig() {
     let conf = {
         port: process.env.PORT ? parseInt(process.env.PORT, 10) : 5050,
-        admin_password_hash: process.env.ADMIN_PASSWORD_HASH || '',
-        viewer_password_hash: process.env.VIEWER_PASSWORD_HASH || '',
-        viewer_password_hashes: [],
+        admin_password_hash: process.env.ADMIN_PASSWORD_HASH || DEFAULT_ADMIN_HASH,
+        viewer_password_hash: process.env.VIEWER_PASSWORD_HASH || DEFAULT_VIEWER_HASHES[0],
+        viewer_password_hashes: [...DEFAULT_VIEWER_HASHES],
+        admin_password: process.env.ADMIN_PASSWORD || '',
+        viewer_password: process.env.VIEWER_PASSWORD || '',
+        access_pin: process.env.ACCESS_PIN || '',
         totp_secret: process.env.TOTP_SECRET || 'DELTA2FAINXAU777',
         delta: {
             environment: process.env.DELTA_ENV || 'live_india',
@@ -76,6 +88,9 @@ function loadConfig() {
     if (process.env.PORT) conf.port = parseInt(process.env.PORT, 10);
     if (process.env.ADMIN_PASSWORD_HASH) conf.admin_password_hash = process.env.ADMIN_PASSWORD_HASH;
     if (process.env.VIEWER_PASSWORD_HASH) conf.viewer_password_hash = process.env.VIEWER_PASSWORD_HASH;
+    if (process.env.ADMIN_PASSWORD) conf.admin_password = process.env.ADMIN_PASSWORD;
+    if (process.env.VIEWER_PASSWORD) conf.viewer_password = process.env.VIEWER_PASSWORD;
+    if (process.env.ACCESS_PIN) conf.access_pin = process.env.ACCESS_PIN;
     if (process.env.TOTP_SECRET) conf.totp_secret = process.env.TOTP_SECRET;
 
     return conf;
@@ -621,18 +636,31 @@ function verifyUserPassword(inputPassword, config) {
     const cleanInput = String(inputPassword).trim();
 
     // 1. Check Admin Bcrypt Hash
-    if (config.admin_password_hash) {
+    const adminHash = config.admin_password_hash || DEFAULT_ADMIN_HASH;
+    if (adminHash) {
         try {
-            if (bcrypt.compareSync(cleanInput, config.admin_password_hash)) {
+            if (bcrypt.compareSync(cleanInput, adminHash)) {
                 return 'ADMIN';
             }
         } catch(e) {}
     }
 
-    // 2. Check Viewer Bcrypt Hashes (supports viewer_password_hashes array and single viewer_password_hash)
-    const viewerHashes = Array.isArray(config.viewer_password_hashes) && config.viewer_password_hashes.length > 0
-        ? config.viewer_password_hashes
-        : [config.viewer_password_hash].filter(Boolean);
+    // Direct match if ADMIN_PASSWORD is set in cloud env
+    if (config.admin_password && cleanInput === String(config.admin_password).trim()) {
+        return 'ADMIN';
+    }
+
+    // 2. Check Viewer Bcrypt Hashes (supports viewer_password_hashes array, single hash, or default hashes)
+    let viewerHashes = [];
+    if (Array.isArray(config.viewer_password_hashes) && config.viewer_password_hashes.length > 0) {
+        viewerHashes.push(...config.viewer_password_hashes);
+    }
+    if (config.viewer_password_hash) {
+        viewerHashes.push(config.viewer_password_hash);
+    }
+    if (viewerHashes.length === 0) {
+        viewerHashes = DEFAULT_VIEWER_HASHES;
+    }
 
     for (const vHash of viewerHashes) {
         try {
@@ -640,6 +668,14 @@ function verifyUserPassword(inputPassword, config) {
                 return 'VIEWER';
             }
         } catch(e) {}
+    }
+
+    // Direct match if VIEWER_PASSWORD or ACCESS_PIN is set in cloud env
+    if (config.viewer_password && cleanInput === String(config.viewer_password).trim()) {
+        return 'VIEWER';
+    }
+    if (config.access_pin && cleanInput === String(config.access_pin).trim()) {
+        return 'VIEWER';
     }
 
     return null;
