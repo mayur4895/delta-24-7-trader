@@ -1493,7 +1493,6 @@ function startServer() {
         let userRole = localStorage.getItem('delta_user_role') || 'ADMIN';
         let pendingTempToken = '';
         let sessionTimer = null;
-        let remainingSeconds = 1800; // 30 minutes
         let dashboardIntervals = [];
 
         // Apply Role Permissions (Viewer vs Master Admin)
@@ -1544,39 +1543,41 @@ function startServer() {
             if (feedSec) feedSec.style.display = isAdmin ? 'block' : 'none';
         }
 
-        // 30-Minute Inactivity Tracker
-        function resetInactivityCountdown() {
-            remainingSeconds = 1800;
-        }
-
-        window.addEventListener('mousemove', resetInactivityCountdown, { passive: true });
-        window.addEventListener('keydown', resetInactivityCountdown, { passive: true });
-        window.addEventListener('click', resetInactivityCountdown, { passive: true });
-        window.addEventListener('scroll', resetInactivityCountdown, { passive: true });
-        window.addEventListener('touchstart', resetInactivityCountdown, { passive: true });
-
+        // 30-Minute Auto-Logout Countdown Timer (Visibly counts down every second)
         function start30MinSessionTimer() {
             if (sessionTimer) clearInterval(sessionTimer);
-            remainingSeconds = 1800;
+
+            // Synchronize with stored session expiry timestamp
+            const now = Date.now();
+            if (!sessionExpiry || sessionExpiry <= now) {
+                sessionExpiry = now + (30 * 60 * 1000);
+                localStorage.setItem('delta_session_expiry', String(sessionExpiry));
+            }
+
             updateSessionDisplay();
-
-            sessionTimer = setInterval(() => {
-                remainingSeconds--;
-                updateSessionDisplay();
-
-                if (remainingSeconds <= 0) {
-                    clearInterval(sessionTimer);
-                    logout('Session expired after 30 minutes of inactivity. Please re-authenticate.');
-                }
-            }, 1000);
+            sessionTimer = setInterval(updateSessionDisplay, 1000);
         }
 
         function updateSessionDisplay() {
-            const mins = Math.floor(Math.max(0, remainingSeconds) / 60);
-            const secs = Math.max(0, remainingSeconds) % 60;
+            const now = Date.now();
+            const diffMs = Math.max(0, sessionExpiry - now);
+            const totalSecs = Math.floor(diffMs / 1000);
+            const mins = Math.floor(totalSecs / 60);
+            const secs = totalSecs % 60;
+
             const el = document.getElementById('session-countdown');
             if (el) {
                 el.textContent = String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+                if (totalSecs <= 300) {
+                    el.style.color = '#f43f5e'; // Warning red when under 5 minutes
+                } else {
+                    el.style.color = '#38bdf8';
+                }
+            }
+
+            if (totalSecs <= 0) {
+                if (sessionTimer) clearInterval(sessionTimer);
+                logout('Session expired after 30 minutes. Please re-authenticate.');
             }
         }
 
