@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Tuple, Optional
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "daily_trades.json")
-MAX_DAILY_TRADES = 3
+MAX_DAILY_TRADES = float("inf")  # Unlimited trades per day
 DEFAULT_RRR = 3  # 1:3 default
 
 
@@ -151,18 +151,7 @@ def process_signal(
     utc_now = get_current_utc_timestamp()
     can_trade, trades_done, today_utc = check_daily_limit()
 
-    # Rule 1: DAILY TRADE LIMIT
-    if not can_trade:
-        return {
-            "status": "REJECTED",
-            "reason": f"DAILY_LIMIT_EXCEEDED: {trades_done}/{MAX_DAILY_TRADES} trades completed for UTC date {today_utc}.",
-            "trades_today": trades_done,
-            "max_trades": MAX_DAILY_TRADES,
-            "reset_time_utc": "00:00:00 UTC",
-            "timestamp_utc": utc_now
-        }
-
-    # Rule 2: MANDATORY STOP LOSS CHECK
+    # Rule 1: MANDATORY STOP LOSS CHECK
     if stop_loss is None or stop_loss <= 0:
         return {
             "status": "REJECTED",
@@ -234,7 +223,7 @@ def process_signal(
     return {
         "status": "APPROVED",
         "trade_number": trades_done + 1,
-        "remaining_trades_today": MAX_DAILY_TRADES - (trades_done + 1 if commit_trade else trades_done),
+        "remaining_trades_today": "Unlimited",
         "trade_details": trade_record,
         "delta_exchange_payload": delta_payload,
         "timestamp_utc": utc_now

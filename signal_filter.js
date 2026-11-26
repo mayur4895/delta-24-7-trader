@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 
 const STATE_FILE = path.join(__dirname, 'daily_trades.json');
-const MAX_DAILY_TRADES = 3;
+const MAX_DAILY_TRADES = Infinity; // Unlimited trades per day
 const DEFAULT_RRR = 3; // 1:3
 
 function getCurrentUtcDate() {
@@ -49,11 +49,10 @@ function checkDailyLimit() {
     const state = loadTradeState();
     const today = getCurrentUtcDate();
     const tradesDone = state.trades_today || 0;
-    const canTrade = tradesDone < MAX_DAILY_TRADES;
     return {
-        canTrade,
+        canTrade: true,
         tradesDone,
-        remainingTrades: Math.max(0, MAX_DAILY_TRADES - tradesDone),
+        remainingTrades: 'Unlimited',
         todayUtc: today
     };
 }
@@ -125,19 +124,7 @@ function processSignal({
     const utcNow = getCurrentUtcTimestamp();
     const limitInfo = checkDailyLimit();
 
-    // 1. Daily Trade Limit Gate
-    if (!limitInfo.canTrade) {
-        return {
-            status: 'REJECTED',
-            reason: `DAILY_LIMIT_EXCEEDED: ${limitInfo.tradesDone}/${MAX_DAILY_TRADES} trades completed for UTC date ${limitInfo.todayUtc}. System in STANDBY until 00:00:00 UTC.`,
-            trades_today: limitInfo.tradesDone,
-            max_daily_trades: MAX_DAILY_TRADES,
-            reset_time_utc: '00:00:00 UTC',
-            timestamp_utc: utcNow
-        };
-    }
-
-    // 2. Mandatory Stop-Loss Gate
+    // 1. Mandatory Stop-Loss Gate
     if (stopLoss == null || isNaN(stopLoss) || stopLoss <= 0) {
         return {
             status: 'REJECTED',
@@ -213,7 +200,7 @@ function processSignal({
     return {
         status: 'APPROVED',
         trade_number: limitInfo.tradesDone + 1,
-        remaining_trades_today: MAX_DAILY_TRADES - (commitTrade ? limitInfo.tradesDone + 1 : limitInfo.tradesDone),
+        remaining_trades_today: 'Unlimited',
         trade_details: tradeRecord,
         delta_exchange_payload: deltaPayload,
         timestamp_utc: utcNow

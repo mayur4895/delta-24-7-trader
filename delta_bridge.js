@@ -72,7 +72,7 @@ function loadConfig() {
             post_news_buffer_minutes: 15
         },
         risk: {
-            max_daily_trades: 3,
+            max_daily_trades: 'unlimited',
             default_rrr: 3,
             capital_risk_percent: process.env.CAPITAL_RISK_PERCENT ? parseFloat(process.env.CAPITAL_RISK_PERCENT) : 5.0
         },
@@ -1476,7 +1476,7 @@ function startServer() {
                 <div style="background: var(--bg-surface); padding: 10px 12px; border-radius: 6px; font-size: 12px; line-height: 1.6; color: var(--text-dim);">
                     <div>• Risk on Capital: <strong style="color: #f59e0b;">5.0% per trade</strong></div>
                     <div>• Target RRR: <strong style="color: #34d399;">Strict 1:3 Reward-to-Risk</strong></div>
-                    <div>• Max Daily Limit: <strong style="color: white;">3 Trades Max (Calendar Day)</strong></div>
+                    <div>• Daily Trade Limit: <strong style="color: #34d399;">Unlimited (No Limit)</strong></div>
                 </div>
             </div>
 
@@ -1551,8 +1551,8 @@ function startServer() {
                     <strong id="header-balance" style="color: #38bdf8;">Loading...</strong>
                 </div>
                 <div class="pill-stat" id="pill-budget">
-                    <span>Daily Budget: </span>
-                    <strong id="header-trades">${limit.tradesDone} / 3 Trades</strong>
+                    <span>Daily Trades: </span>
+                    <strong id="header-trades" style="color: #34d399;">${limit.tradesDone} (Unlimited)</strong>
                 </div>
                 <div class="pill-stat" id="pill-session" style="border-color: rgba(56, 189, 248, 0.35);">
                     <span>Session: </span>

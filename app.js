@@ -22,7 +22,7 @@ const scanIntervalSeconds = parseInt(process.env.SCAN_INTERVAL_SECONDS || '60', 
 console.log(`[INIT] Environment: ${config.delta.environment.toUpperCase()}`);
 console.log(`[INIT] Target Symbol: ${symbol} (15-Minute Candles)`);
 console.log(`[INIT] Scan Frequency: Every ${scanIntervalSeconds} seconds`);
-console.log(`[INIT] Max Daily Trades: 3 (Enforced calendar-day limit)`);
+console.log(`[INIT] Daily Trades: Unlimited (No Limit)`);
 console.log(`[INIT] Adaptive Leverage: Active (Auto-sizes for ₹51 / $0.60+ capital)\n`);
 
 // 2. Start HTTP Webhook & Dashboard Server
