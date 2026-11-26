@@ -59,9 +59,11 @@ class StrategyScanner {
      */
     fetchDeltaCandles(symbol = this.symbol, resolution = '15', lookbackDays = 4) {
         return new Promise((resolve, reject) => {
+            const symUpper = (symbol || '').toUpperCase();
+            const deltaSymbol = (symUpper === 'XAUUSD' || symUpper === 'GOLD' || symUpper === 'XAU') ? 'PAXGUSD' : symbol;
             const now = Math.floor(Date.now() / 1000);
             const from = now - (lookbackDays * 86400);
-            const url = `https://api.india.delta.exchange/v2/chart/history?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${now}`;
+            const url = `https://api.india.delta.exchange/v2/chart/history?symbol=${deltaSymbol}&resolution=${resolution}&from=${from}&to=${now}`;
 
             https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
                 let data = '';

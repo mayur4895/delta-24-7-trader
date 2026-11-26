@@ -17,6 +17,7 @@ const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const bcrypt = require('bcryptjs');
 
 const { processSignal, checkDailyLimit, loadTradeState, saveTradeState } = require('./signal_filter');
 const { checkNewsLockout } = require('./modules/news_filter');
@@ -32,7 +33,9 @@ function setActiveScanner(scanner) {
 function loadConfig() {
     let conf = {
         port: process.env.PORT ? parseInt(process.env.PORT, 10) : 5050,
-        access_pin: process.env.ACCESS_PIN || 'delta2026',
+        admin_password_hash: process.env.ADMIN_PASSWORD_HASH || '',
+        viewer_password_hash: process.env.VIEWER_PASSWORD_HASH || '',
+        viewer_password_hashes: [],
         totp_secret: process.env.TOTP_SECRET || 'DELTA2FAINXAU777',
         delta: {
             environment: process.env.DELTA_ENV || 'live_india',
@@ -71,7 +74,8 @@ function loadConfig() {
     if (process.env.DELTA_API_SECRET) conf.delta.api_secret = process.env.DELTA_API_SECRET;
     if (process.env.DELTA_ENV) conf.delta.environment = process.env.DELTA_ENV;
     if (process.env.PORT) conf.port = parseInt(process.env.PORT, 10);
-    if (process.env.ACCESS_PIN) conf.access_pin = process.env.ACCESS_PIN;
+    if (process.env.ADMIN_PASSWORD_HASH) conf.admin_password_hash = process.env.ADMIN_PASSWORD_HASH;
+    if (process.env.VIEWER_PASSWORD_HASH) conf.viewer_password_hash = process.env.VIEWER_PASSWORD_HASH;
     if (process.env.TOTP_SECRET) conf.totp_secret = process.env.TOTP_SECRET;
 
     return conf;
@@ -609,8 +613,37 @@ async function handleTradeSignal(signalData) {
 }
 
 // Active 30-Minute Sessions & 2FA State
-const activeSessions = new Map(); // token -> { createdAt, expiresAt }
+const activeSessions = new Map(); // token -> { role: 'ADMIN' | 'VIEWER', createdAt, expiresAt }
 const pending2FATokens = new Map(); // tempToken -> { createdAt, expiresAt }
+
+function verifyUserPassword(inputPassword, config) {
+    if (!inputPassword) return null;
+    const cleanInput = String(inputPassword).trim();
+
+    // 1. Check Admin Bcrypt Hash
+    if (config.admin_password_hash) {
+        try {
+            if (bcrypt.compareSync(cleanInput, config.admin_password_hash)) {
+                return 'ADMIN';
+            }
+        } catch(e) {}
+    }
+
+    // 2. Check Viewer Bcrypt Hashes (supports viewer_password_hashes array and single viewer_password_hash)
+    const viewerHashes = Array.isArray(config.viewer_password_hashes) && config.viewer_password_hashes.length > 0
+        ? config.viewer_password_hashes
+        : [config.viewer_password_hash].filter(Boolean);
+
+    for (const vHash of viewerHashes) {
+        try {
+            if (vHash && bcrypt.compareSync(cleanInput, vHash)) {
+                return 'VIEWER';
+            }
+        } catch(e) {}
+    }
+
+    return null;
+}
 
 function base32Decode(base32) {
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
@@ -659,7 +692,7 @@ function generateTotp(secret) {
 }
 
 // Authentication Check: Auto-expires sessions after 30 minutes of inactivity
-function isAuthorized(req, config) {
+function isAuthorized(req, config, requireAdmin = false) {
     const headerToken = req.headers['x-session-token'] || req.headers['x-access-pin'];
     const authHeader = req.headers['authorization'] || '';
     const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
@@ -677,12 +710,19 @@ function isAuthorized(req, config) {
         }
         // Sliding window: reset 30 minutes on active user interaction
         session.expiresAt = Date.now() + (30 * 60 * 1000);
+
+        if (requireAdmin && session.role !== 'ADMIN') {
+            return false;
+        }
         return true;
     }
 
-    // Direct password match (for scripts/webhooks)
-    const expected = String(config.access_pin || 'delta2026').trim();
-    if (token === expected) return true;
+    // Direct password match via bcrypt
+    const directRole = verifyUserPassword(token, config);
+    if (directRole) {
+        if (requireAdmin && directRole !== 'ADMIN') return false;
+        return true;
+    }
 
     return false;
 }
@@ -770,31 +810,32 @@ function startServer() {
                     const data = JSON.parse(body || '{}');
                     const tempToken = String(data.temp_token || '').trim();
                     const password = String(data.password || '').trim();
-                    const expectedPass = String(config.access_pin || 'delta2026').trim();
 
-                    // Check temp token
+                    // Check temp token from Step 1 (2FA)
                     if (!pending2FATokens.has(tempToken) || Date.now() > pending2FATokens.get(tempToken).expiresAt) {
                         res.writeHead(401, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({ success: false, error: '2FA_REQUIRED', message: '2FA session expired. Please complete Step 1 (2FA) first.' }));
                     }
 
-                    if (password === expectedPass) {
+                    const role = verifyUserPassword(password, config);
+                    if (role) {
                         pending2FATokens.delete(tempToken);
                         const sessionToken = crypto.randomBytes(32).toString('hex');
                         const expiresAt = Date.now() + (30 * 60 * 1000); // Strict 30-minute auto-logout
-                        activeSessions.set(sessionToken, { createdAt: Date.now(), expiresAt });
+                        activeSessions.set(sessionToken, { role: role, createdAt: Date.now(), expiresAt });
 
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({
                             success: true,
                             token: sessionToken,
+                            role: role,
                             expires_at: expiresAt,
                             expires_in_seconds: 1800,
-                            message: 'Authenticated successfully. Session valid for 30 minutes.'
+                            message: `Authenticated successfully as ${role}. Session valid for 30 minutes.`
                         }));
                     } else {
                         res.writeHead(401, { 'Content-Type': 'application/json' });
-                        return res.end(JSON.stringify({ success: false, error: 'INCORRECT_PASSWORD', message: 'Incorrect Master Password.' }));
+                        return res.end(JSON.stringify({ success: false, error: 'INCORRECT_PASSWORD', message: 'Incorrect Password.' }));
                     }
                 } catch(e) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -813,7 +854,6 @@ function startServer() {
                     const data = JSON.parse(body || '{}');
                     const inputPin = String(data.pin || data.password || '').trim();
                     const input2fa = String(data.code_2fa || data.code || '').trim();
-                    const expectedPin = String(config.access_pin || 'delta2026').trim();
                     const secret = config.totp_secret || 'DELTA2FAINXAU777';
 
                     let is2faOk = true;
@@ -821,18 +861,19 @@ function startServer() {
                         is2faOk = verifyTotp(secret, input2fa);
                     }
 
-                    if (inputPin === expectedPin && is2faOk) {
+                    const role = verifyUserPassword(inputPin, config);
+                    if (role && is2faOk) {
                         const sessionToken = crypto.randomBytes(32).toString('hex');
                         const expiresAt = Date.now() + (30 * 60 * 1000);
-                        activeSessions.set(sessionToken, { createdAt: Date.now(), expiresAt });
+                        activeSessions.set(sessionToken, { role: role, createdAt: Date.now(), expiresAt });
 
                         res.writeHead(200, { 'Content-Type': 'application/json' });
-                        return res.end(JSON.stringify({ success: true, token: sessionToken, expires_at: expiresAt, expires_in_seconds: 1800 }));
+                        return res.end(JSON.stringify({ success: true, token: sessionToken, role: role, expires_at: expiresAt, expires_in_seconds: 1800 }));
                     } else {
                         res.writeHead(401, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({
                             success: false,
-                            error: !is2faOk ? 'INVALID_2FA_CODE' : 'INCORRECT_PIN',
+                            error: !is2faOk ? 'INVALID_2FA_CODE' : 'INCORRECT_PASSWORD',
                             message: !is2faOk ? 'Invalid 2FA code.' : 'Incorrect password.'
                         }));
                     }
@@ -844,11 +885,11 @@ function startServer() {
             return;
         }
 
-        // Change Master Password endpoint (Protected)
+        // Change Master Password endpoint (Protected: Master Admin Only)
         if (req.method === 'POST' && cleanPath === '/api/auth/change-password') {
-            if (!isAuthorized(req, config)) {
-                res.writeHead(401, { 'Content-Type': 'application/json' });
-                return res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Master Admin privileges required to change security settings.' }));
             }
             let body = '';
             req.on('data', chunk => body += chunk);
@@ -861,11 +902,22 @@ function startServer() {
                         return res.end(JSON.stringify({ success: false, error: 'PASSWORD_TOO_SHORT', message: 'New password must be at least 4 characters.' }));
                     }
 
-                    config.access_pin = newPass;
-                    const cfgPath = path.join(__dirname, 'config.json');
-                    fs.writeFileSync(cfgPath, JSON.stringify(config, null, 2));
+                    const newHash = bcrypt.hashSync(newPass, 10);
+                    config.admin_password_hash = newHash;
 
-                    console.log(`[Delta Bridge] Master Password successfully updated by owner.`);
+                    try {
+                        const cfgPath = path.join(__dirname, 'config.json');
+                        let curCfg = {};
+                        if (fs.existsSync(cfgPath)) {
+                            curCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+                        }
+                        curCfg.admin_password_hash = newHash;
+                        fs.writeFileSync(cfgPath, JSON.stringify(curCfg, null, 2));
+                    } catch(err) {
+                        console.error('[Delta Bridge] Error writing config.json:', err.message);
+                    }
+
+                    console.log(`[Delta Bridge] Master Password bcrypt hash successfully updated by owner.`);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     return res.end(JSON.stringify({ success: true, message: 'Master Password updated successfully!' }));
                 } catch(e) {
@@ -908,22 +960,30 @@ function startServer() {
             }
         }
 
-        // Fetch Balance endpoint
+        // Fetch Balance endpoint (Master Admin Only)
         if (req.method === 'GET' && cleanPath === '/api/balance') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Balance viewing restricted to Master Admin.' }));
+            }
             const balRes = await fetchDeltaBalance(config);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify(balRes, null, 2));
         }
 
-        // Live Scanner Status endpoint
+        // Live Scanner Status endpoint (Viewer & Admin)
         if (req.method === 'GET' && cleanPath === '/api/scanner-status') {
             const status = activeScanner ? activeScanner.getStatus() : { running: false, summary: 'Scanner not running' };
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify(status, null, 2));
         }
 
-        // Scanner Toggle endpoint
+        // Scanner Toggle endpoint (Master Admin Only)
         if (req.method === 'POST' && cleanPath === '/api/scanner-toggle') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Scanner control restricted to Master Admin.' }));
+            }
             if (!activeScanner) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 return res.end(JSON.stringify({ error: 'NO_SCANNER' }));
@@ -937,7 +997,7 @@ function startServer() {
             return res.end(JSON.stringify({ running: activeScanner.isRunning }));
         }
 
-        // Multi-Asset Setup Diagnostic Analyzer endpoint
+        // Multi-Asset Setup Diagnostic Analyzer endpoint (Viewer & Admin)
         if (req.method === 'GET' && (cleanPath === '/api/analyze' || cleanPath.startsWith('/api/analyze/'))) {
             const targetSymbol = (cleanPath.replace('/api/analyze/', '').replace('/api/analyze', '') || urlObj.searchParams.get('symbol') || 'XRPUSD').toUpperCase();
             if (activeScanner) {
@@ -955,8 +1015,12 @@ function startServer() {
             }
         }
 
-        // Place Resting Zone Limit Order endpoint (Option 2)
+        // Place Resting Zone Limit Order endpoint (Master Admin Only)
         if (req.method === 'POST' && cleanPath === '/api/order/limit') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Order execution restricted to Master Admin.' }));
+            }
             let body = '';
             req.on('data', chunk => body += chunk);
             req.on('end', async () => {
@@ -989,22 +1053,34 @@ function startServer() {
             return;
         }
 
-        // Live Positions endpoint
+        // Live Positions endpoint (Master Admin Only)
         if (req.method === 'GET' && cleanPath === '/api/positions') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Positions viewing restricted to Master Admin.' }));
+            }
             const posRes = await fetchDeltaPositions(config);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify(posRes, null, 2));
         }
 
-        // Live Open Orders endpoint
+        // Live Open Orders endpoint (Master Admin Only)
         if (req.method === 'GET' && cleanPath === '/api/orders') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Orders viewing restricted to Master Admin.' }));
+            }
             const ordRes = await fetchDeltaOrders(config);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify(ordRes, null, 2));
         }
 
-        // Cancel Order endpoint
+        // Cancel Order endpoint (Master Admin Only)
         if (req.method === 'POST' && cleanPath === '/api/order/cancel') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Order cancellation restricted to Master Admin.' }));
+            }
             let body = '';
             req.on('data', chunk => body += chunk);
             req.on('end', async () => {
@@ -1021,8 +1097,12 @@ function startServer() {
             return;
         }
 
-        // Reset Counter endpoint
+        // Reset Counter endpoint (Master Admin Only)
         if (req.method === 'POST' && cleanPath === '/reset-counter') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Counter reset restricted to Master Admin.' }));
+            }
             const today = new Date().toISOString().slice(0, 10);
             saveTradeState({ current_date: today, trades_today: 0, history: [] });
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1227,31 +1307,31 @@ function startServer() {
                 <div class="brand-title">
                     <span>⚡ DELTA EXCHANGE INDIA</span>
                     <span class="badge-live">LIVE INSTITUTIONAL</span>
-                    <span style="font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);">🛡️ 2FA + Master Password</span>
+                    <span id="user-role-badge" style="font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);">🛡️ 2FA + Master Password</span>
                 </div>
                 <small style="color: var(--text-muted); font-size: 12px;">24/7 Supply & Demand Flow Terminal • Strict 1:3 RRR • Margin Safety Buffer</small>
             </div>
             <div class="header-meta">
-                <div class="pill-stat">
+                <div class="pill-stat" id="pill-balance">
                     <span>Wallet Balance: </span>
                     <strong id="header-balance" style="color: #38bdf8;">Loading...</strong>
                 </div>
-                <div class="pill-stat">
+                <div class="pill-stat" id="pill-budget">
                     <span>Daily Budget: </span>
                     <strong id="header-trades">${limit.tradesDone} / 3 Trades</strong>
                 </div>
-                <div class="pill-stat" style="border-color: rgba(56, 189, 248, 0.35);">
+                <div class="pill-stat" id="pill-session" style="border-color: rgba(56, 189, 248, 0.35);">
                     <span>Session: </span>
                     <strong id="session-countdown" style="color: #38bdf8;">30:00</strong>
                 </div>
-                <button class="btn btn-secondary" onclick="openSecurityModal()" style="padding: 6px 12px; font-size: 12px;" title="View or change login password & 2FA settings">⚙️ Security</button>
-                <button class="btn btn-secondary" onclick="logout('Locked by owner.')" style="padding: 6px 12px; font-size: 12px;">🔒 Lock</button>
+                <button class="btn btn-secondary" id="btn-security-settings" onclick="openSecurityModal()" style="padding: 6px 12px; font-size: 12px;" title="View or change login password & 2FA settings">⚙️ Security</button>
+                <button class="btn btn-secondary" id="btn-lock" onclick="logout('Locked by owner.')" style="padding: 6px 12px; font-size: 12px;">🔒 Lock</button>
             </div>
         </div>
 
         <!-- Symbol Selector Pills -->
         <div class="symbol-tabs">
-            <button class="tab-btn active" onclick="selectSymbol('PAXGUSD', this)">🪙 Gold (PAXGUSD)</button>
+            <button class="tab-btn active" onclick="selectSymbol('XAUUSD', this)">🪙 Gold (XAUUSD)</button>
             <button class="tab-btn" onclick="selectSymbol('XRPUSD', this)">Ripple (XRPUSD)</button>
             <button class="tab-btn" onclick="selectSymbol('BTCUSD', this)">Bitcoin (BTCUSD)</button>
             <button class="tab-btn" onclick="selectSymbol('ETHUSD', this)">Ethereum (ETHUSD)</button>
@@ -1262,7 +1342,7 @@ function startServer() {
         <div class="setup-card">
             <div class="setup-top">
                 <div class="setup-title">
-                    <span id="active-symbol-badge" style="color: #38bdf8;">XRPUSD</span>
+                    <span id="active-symbol-badge" style="color: #38bdf8;">Gold (XAUUSD)</span>
                     <span>Institutional Flow Diagnostic</span>
                 </div>
                 <div id="setup-status-badge" class="setup-badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid #f59e0b;">
@@ -1304,8 +1384,8 @@ function startServer() {
             </div>
         </div>
 
-        <!-- Two Clear Execution Choices -->
-        <div class="modes-grid">
+        <!-- Two Clear Execution Choices (Master Admin Only) -->
+        <div class="modes-grid" id="execution-modes-grid">
             <!-- Option 1: 24/7 Automated Candle Scanner -->
             <div class="mode-box active-mode">
                 <div>
@@ -1344,8 +1424,8 @@ function startServer() {
             </div>
         </div>
 
-        <!-- Active Open Positions Table -->
-        <div class="section-table">
+        <!-- Active Open Positions Table (Master Admin Only) -->
+        <div class="section-table" id="positions-section">
             <div class="section-header">
                 <span>Active Positions on Delta Exchange India</span>
                 <button class="btn btn-secondary" onclick="refreshPositionsAndOrders()" style="font-size: 11px; padding: 4px 10px;">🔄 Refresh</button>
@@ -1369,8 +1449,8 @@ function startServer() {
             </table>
         </div>
 
-        <!-- Resting Pending Orders Table -->
-        <div class="section-table">
+        <!-- Resting Pending Orders Table (Master Admin Only) -->
+        <div class="section-table" id="orders-section">
             <div class="section-header">
                 <span>Resting Orders on Delta Exchange Orderbook</span>
             </div>
@@ -1394,8 +1474,8 @@ function startServer() {
             </table>
         </div>
 
-        <!-- 24/7 Scanner Audit Feed -->
-        <div class="section-table">
+        <!-- 24/7 Scanner Audit Feed (Master Admin Only) -->
+        <div class="section-table" id="audit-feed-section">
             <div class="section-header">
                 <span>Live 24/7 Cloud Candle Evaluation Feed</span>
             </div>
@@ -1406,13 +1486,63 @@ function startServer() {
     </div>
 
     <script>
-        let currentSymbol = 'PAXGUSD';
+        let currentSymbol = 'XAUUSD';
         let currentAnalysis = null;
         let sessionToken = localStorage.getItem('delta_session_token') || localStorage.getItem('delta_access_token') || '';
         let sessionExpiry = parseInt(localStorage.getItem('delta_session_expiry') || '0', 10);
+        let userRole = localStorage.getItem('delta_user_role') || 'ADMIN';
         let pendingTempToken = '';
         let sessionTimer = null;
         let remainingSeconds = 1800; // 30 minutes
+        let dashboardIntervals = [];
+
+        // Apply Role Permissions (Viewer vs Master Admin)
+        function applyRolePermissions(role) {
+            userRole = role || 'ADMIN';
+            const isAdmin = (userRole === 'ADMIN');
+
+            const pillBal = document.getElementById('pill-balance');
+            const pillBud = document.getElementById('pill-budget');
+            const btnSec = document.getElementById('btn-security-settings');
+            const btnLock = document.getElementById('btn-lock');
+            const roleBadge = document.getElementById('user-role-badge');
+
+            if (pillBal) pillBal.style.display = isAdmin ? 'inline-flex' : 'none';
+            if (pillBud) pillBud.style.display = isAdmin ? 'inline-flex' : 'none';
+            if (btnSec) btnSec.style.display = isAdmin ? 'inline-flex' : 'none';
+            if (btnLock) {
+                btnLock.style.display = 'inline-flex';
+                btnLock.textContent = isAdmin ? '🔒 Lock' : '🚪 Exit';
+            }
+
+            if (roleBadge) {
+                if (isAdmin) {
+                    roleBadge.innerHTML = '👑 MASTER ADMIN (Full Access)';
+                    roleBadge.style.color = '#38bdf8';
+                    roleBadge.style.borderColor = 'rgba(56, 189, 248, 0.4)';
+                    roleBadge.style.background = 'rgba(56, 189, 248, 0.15)';
+                    roleBadge.style.cursor = 'default';
+                } else {
+                    roleBadge.innerHTML = '👁️ MARKET VIEWER (Diagnostics Only)';
+                    roleBadge.style.color = '#34d399';
+                    roleBadge.style.borderColor = 'rgba(52, 211, 153, 0.4)';
+                    roleBadge.style.background = 'rgba(52, 211, 153, 0.15)';
+                    roleBadge.style.cursor = 'pointer';
+                    roleBadge.title = 'Click to exit viewer mode';
+                    roleBadge.onclick = () => logout('Exited viewer session.');
+                }
+            }
+
+            const execGrid = document.getElementById('execution-modes-grid');
+            const posSec = document.getElementById('positions-section');
+            const ordSec = document.getElementById('orders-section');
+            const feedSec = document.getElementById('audit-feed-section');
+
+            if (execGrid) execGrid.style.display = isAdmin ? 'grid' : 'none';
+            if (posSec) posSec.style.display = isAdmin ? 'block' : 'none';
+            if (ordSec) ordSec.style.display = isAdmin ? 'block' : 'none';
+            if (feedSec) feedSec.style.display = isAdmin ? 'block' : 'none';
+        }
 
         // 30-Minute Inactivity Tracker
         function resetInactivityCountdown() {
@@ -1461,6 +1591,8 @@ function startServer() {
                 document.getElementById('auth-modal').style.display = 'none';
                 const app = document.getElementById('terminal-app');
                 if (app) app.style.display = 'block';
+                userRole = localStorage.getItem('delta_user_role') || 'ADMIN';
+                applyRolePermissions(userRole);
                 start30MinSessionTimer();
                 initDashboard();
             }
@@ -1517,7 +1649,6 @@ function startServer() {
                 } else {
                     errEl.style.display = 'block';
                     errEl.textContent = data.message || 'Invalid 2FA code. Please check your Authenticator app.';
-                    fetchTotpHint();
                 }
             } catch(e) {
                 errEl.style.display = 'block';
@@ -1528,7 +1659,7 @@ function startServer() {
             }
         }
 
-        // Submit Step 2: Master Password
+        // Submit Step 2: Master or Viewer Password
         async function submitPassword() {
             const pwd = document.getElementById('input-password').value.trim();
             const errEl = document.getElementById('password-error');
@@ -1536,7 +1667,7 @@ function startServer() {
 
             if (!pwd) {
                 errEl.style.display = 'block';
-                errEl.textContent = 'Please enter your Master Password.';
+                errEl.textContent = 'Please enter your password.';
                 return;
             }
 
@@ -1554,17 +1685,20 @@ function startServer() {
                 if (data.success && data.token) {
                     sessionToken = data.token;
                     sessionExpiry = data.expires_at || (Date.now() + 30 * 60 * 1000);
+                    userRole = data.role || 'ADMIN';
                     localStorage.setItem('delta_session_token', sessionToken);
                     localStorage.setItem('delta_session_expiry', String(sessionExpiry));
+                    localStorage.setItem('delta_user_role', userRole);
 
                     document.getElementById('auth-modal').style.display = 'none';
                     const app = document.getElementById('terminal-app');
                     if (app) app.style.display = 'block';
+                    applyRolePermissions(userRole);
                     start30MinSessionTimer();
                     initDashboard();
                 } else {
                     errEl.style.display = 'block';
-                    errEl.textContent = data.message || 'Incorrect Master Password.';
+                    errEl.textContent = data.message || 'Incorrect Password.';
                     if (data.error === '2FA_REQUIRED') {
                         setTimeout(showAuthStep1, 1500);
                     }
@@ -1593,10 +1727,13 @@ function startServer() {
             localStorage.removeItem('delta_session_token');
             localStorage.removeItem('delta_session_expiry');
             localStorage.removeItem('delta_access_token');
+            localStorage.removeItem('delta_user_role');
             sessionToken = '';
             sessionExpiry = 0;
             pendingTempToken = '';
             if (sessionTimer) clearInterval(sessionTimer);
+            dashboardIntervals.forEach(clearInterval);
+            dashboardIntervals = [];
 
             const app = document.getElementById('terminal-app');
             if (app) app.style.display = 'none';
@@ -1676,13 +1813,15 @@ function startServer() {
             currentSymbol = sym;
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             if (el) el.classList.add('active');
-            document.getElementById('active-symbol-badge').textContent = sym;
+            const displayLabel = (sym === 'XAUUSD' || sym === 'PAXGUSD' || sym === 'GOLD') ? 'Gold (XAUUSD)' : sym;
+            document.getElementById('active-symbol-badge').textContent = displayLabel;
             loadMarketAnalysis(sym);
         }
 
         async function loadMarketAnalysis(sym) {
             const expBox = document.getElementById('diagnostic-explanation');
-            expBox.innerHTML = 'Analyzing 15M candles and 4H trend structure for ' + sym + '...';
+            const displayLabel = (sym === 'XAUUSD' || sym === 'PAXGUSD' || sym === 'GOLD') ? 'Gold (XAUUSD)' : sym;
+            expBox.innerHTML = 'Analyzing 15M candles and 4H trend structure for ' + displayLabel + '...';
             try {
                 const res = await fetch('/api/analyze/' + sym, { headers: authHeaders() });
                 if (res.status === 401) { logout(); return; }
@@ -1696,6 +1835,9 @@ function startServer() {
 
         function renderAnalysis(data) {
             if (!data || data.error) return;
+
+            const displayLabel = (currentSymbol === 'XAUUSD' || currentSymbol === 'PAXGUSD' || currentSymbol === 'GOLD') ? 'Gold (XAUUSD)' : (data.symbol || currentSymbol);
+            document.getElementById('active-symbol-badge').textContent = displayLabel;
 
             document.getElementById('metric-live-price').textContent = '$' + data.livePrice;
             const trendEl = document.getElementById('metric-trend');
@@ -1745,6 +1887,7 @@ function startServer() {
         }
 
         async function fetchLiveBalance() {
+            if (userRole !== 'ADMIN') return;
             try {
                 const res = await fetch('/api/balance', { headers: authHeaders() });
                 if (res.status === 401) { logout(); return; }
@@ -1766,25 +1909,29 @@ function startServer() {
                 const statePill = document.getElementById('scanner-state-pill');
                 const btnToggle = document.getElementById('btn-toggle-scanner');
 
-                if (data.running) {
-                    statePill.textContent = 'RUNNING';
-                    statePill.style.background = '#064e3b';
-                    statePill.style.color = '#34d399';
-                    btnToggle.textContent = '⏸️ Pause Scanner';
-                } else {
-                    statePill.textContent = 'PAUSED';
-                    statePill.style.background = '#78350f';
-                    statePill.style.color = '#fbbf24';
-                    btnToggle.textContent = '▶️ Resume Scanner';
+                if (statePill) {
+                    if (data.running) {
+                        statePill.textContent = 'RUNNING';
+                        statePill.style.background = '#064e3b';
+                        statePill.style.color = '#34d399';
+                        if (btnToggle) btnToggle.textContent = '⏸️ Pause Scanner';
+                    } else {
+                        statePill.textContent = 'PAUSED';
+                        statePill.style.background = '#78350f';
+                        statePill.style.color = '#fbbf24';
+                        if (btnToggle) btnToggle.textContent = '▶️ Resume Scanner';
+                    }
                 }
 
                 if (data.logs && data.logs.length > 0) {
-                    document.getElementById('scanner-audit-feed').innerHTML = data.logs.map(l => '<div>' + l + '</div>').join('');
+                    const feed = document.getElementById('scanner-audit-feed');
+                    if (feed) feed.innerHTML = data.logs.map(l => '<div>' + l + '</div>').join('');
                 }
             } catch(e) {}
         }
 
         async function toggleScanner() {
+            if (userRole !== 'ADMIN') return;
             try {
                 await fetch('/api/scanner-toggle', { method: 'POST', headers: authHeaders() });
                 fetchScannerStatus();
@@ -1792,6 +1939,10 @@ function startServer() {
         }
 
         async function placeZoneLimitOrder() {
+            if (userRole !== 'ADMIN') {
+                alert('Placement restricted to Master Admin.');
+                return;
+            }
             if (!currentAnalysis || !currentAnalysis.targetZone) {
                 alert('No active target zone found to place limit order!');
                 return;
@@ -1833,6 +1984,7 @@ function startServer() {
         }
 
         async function refreshPositionsAndOrders() {
+            if (userRole !== 'ADMIN') return;
             try {
                 const [posRes, ordRes] = await Promise.all([
                     fetch('/api/positions', { headers: authHeaders() }).then(r => r.json()),
@@ -1841,51 +1993,56 @@ function startServer() {
 
                 // Render positions
                 const posBody = document.getElementById('positions-body');
-                if (posRes.positions && posRes.positions.length > 0) {
-                    posBody.innerHTML = posRes.positions.map(p => {
-                        const sideColor = p.size > 0 ? '#10b981' : '#f43f5e';
-                        const sideLabel = p.size > 0 ? 'LONG' : 'SHORT';
-                        const pnlColor = parseFloat(p.unrealized_pnl) >= 0 ? '#10b981' : '#f43f5e';
-                        return '<tr>' +
-                            '<td><strong>' + (p.product_symbol || p.symbol) + '</strong></td>' +
-                            '<td style="color: ' + sideColor + '">' + sideLabel + '</td>' +
-                            '<td>' + p.size + '</td>' +
-                            '<td>$' + p.entry_price + '</td>' +
-                            '<td>$' + p.mark_price + '</td>' +
-                            '<td>$' + p.margin + '</td>' +
-                            '<td style="color: ' + pnlColor + '">' + p.unrealized_pnl + '</td>' +
-                            '<td>$' + (p.liquidation_price || '-') + '</td>' +
-                        '</tr>';
-                    }).join('');
-                } else {
-                    posBody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No open positions active.</td></tr>';
+                if (posBody) {
+                    if (posRes.positions && posRes.positions.length > 0) {
+                        posBody.innerHTML = posRes.positions.map(p => {
+                            const sideColor = p.size > 0 ? '#10b981' : '#f43f5e';
+                            const sideLabel = p.size > 0 ? 'LONG' : 'SHORT';
+                            const pnlColor = parseFloat(p.unrealized_pnl) >= 0 ? '#10b981' : '#f43f5e';
+                            return '<tr>' +
+                                '<td><strong>' + (p.product_symbol || p.symbol) + '</strong></td>' +
+                                '<td style="color: ' + sideColor + '">' + sideLabel + '</td>' +
+                                '<td>' + p.size + '</td>' +
+                                '<td>$' + p.entry_price + '</td>' +
+                                '<td>$' + p.mark_price + '</td>' +
+                                '<td>$' + p.margin + '</td>' +
+                                '<td style="color: ' + pnlColor + '">' + p.unrealized_pnl + '</td>' +
+                                '<td>$' + (p.liquidation_price || '-') + '</td>' +
+                            '</tr>';
+                        }).join('');
+                    } else {
+                        posBody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No open positions active.</td></tr>';
+                    }
                 }
 
                 // Render orders
                 const ordBody = document.getElementById('orders-body');
-                if (ordRes.orders && ordRes.orders.length > 0) {
-                    ordBody.innerHTML = ordRes.orders.map(o => {
-                        const sideColor = o.side === 'buy' ? '#10b981' : '#f43f5e';
-                        const timeStr = o.created_at ? o.created_at.slice(11, 19) : '-';
-                        return '<tr>' +
-                            '<td>' + timeStr + '</td>' +
-                            '<td><strong>' + o.product_symbol + '</strong></td>' +
-                            '<td>' + o.order_type + '</td>' +
-                            '<td style="color: ' + sideColor + '">' + o.side.toUpperCase() + '</td>' +
-                            '<td>$' + (o.limit_price || o.stop_price || '-') + '</td>' +
-                            '<td>' + o.size + '</td>' +
-                            '<td>$' + (o.bracket_stop_loss_price || '-') + '</td>' +
-                            '<td>$' + (o.bracket_take_profit_price || '-') + '</td>' +
-                            '<td><button class="btn btn-danger" style="padding: 3px 8px; font-size: 11px;" onclick="cancelOrder(' + o.id + ', ' + (o.product_id || 0) + ')">Cancel</button></td>' +
-                        '</tr>';
-                    }).join('');
-                } else {
-                    ordBody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-muted);">No resting limit orders on book.</td></tr>';
+                if (ordBody) {
+                    if (ordRes.orders && ordRes.orders.length > 0) {
+                        ordBody.innerHTML = ordRes.orders.map(o => {
+                            const sideColor = o.side === 'buy' ? '#10b981' : '#f43f5e';
+                            const timeStr = o.created_at ? o.created_at.slice(11, 19) : '-';
+                            return '<tr>' +
+                                '<td>' + timeStr + '</td>' +
+                                '<td><strong>' + o.product_symbol + '</strong></td>' +
+                                '<td>' + o.order_type + '</td>' +
+                                '<td style="color: ' + sideColor + '">' + o.side.toUpperCase() + '</td>' +
+                                '<td>$' + (o.limit_price || o.stop_price || '-') + '</td>' +
+                                '<td>' + o.size + '</td>' +
+                                '<td>$' + (o.bracket_stop_loss_price || '-') + '</td>' +
+                                '<td>$' + (o.bracket_take_profit_price || '-') + '</td>' +
+                                '<td><button class="btn btn-danger" style="padding: 3px 8px; font-size: 11px;" onclick="cancelOrder(' + o.id + ', ' + (o.product_id || 0) + ')">Cancel</button></td>' +
+                            '</tr>';
+                        }).join('');
+                    } else {
+                        ordBody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-muted);">No resting limit orders on book.</td></tr>';
+                    }
                 }
             } catch(e) {}
         }
 
         async function cancelOrder(orderId, productId) {
+            if (userRole !== 'ADMIN') return;
             if (!confirm('Cancel order #' + orderId + '?')) return;
             try {
                 const res = await fetch('/api/order/cancel', {
@@ -1906,14 +2063,23 @@ function startServer() {
         }
 
         function initDashboard() {
-            fetchLiveBalance();
-            loadMarketAnalysis(currentSymbol);
-            fetchScannerStatus();
-            refreshPositionsAndOrders();
+            dashboardIntervals.forEach(clearInterval);
+            dashboardIntervals = [];
 
-            setInterval(fetchScannerStatus, 4000);
-            setInterval(fetchLiveBalance, 15000);
-            setInterval(refreshPositionsAndOrders, 10000);
+            applyRolePermissions(userRole);
+            loadMarketAnalysis(currentSymbol);
+
+            if (userRole === 'ADMIN') {
+                fetchLiveBalance();
+                fetchScannerStatus();
+                refreshPositionsAndOrders();
+
+                dashboardIntervals.push(setInterval(fetchScannerStatus, 4000));
+                dashboardIntervals.push(setInterval(fetchLiveBalance, 15000));
+                dashboardIntervals.push(setInterval(refreshPositionsAndOrders, 10000));
+            } else {
+                dashboardIntervals.push(setInterval(() => loadMarketAnalysis(currentSymbol), 10000));
+            }
         }
 
         window.onload = checkAuth;
