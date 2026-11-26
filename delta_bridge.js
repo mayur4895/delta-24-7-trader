@@ -718,14 +718,17 @@ function startServer() {
             }, null, 2));
         }
 
-        // 2FA Info & Live Code Helper endpoint (Public for easy setup)
+        // 2FA Info Helper endpoint (Protected: Authorized Admin Only)
         if (req.method === 'GET' && cleanPath === '/api/auth/totp-hint') {
+            if (!isAuthorized(req, config)) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+            }
             const secret = config.totp_secret || 'DELTA2FAINXAU777';
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({
                 secret: secret,
                 account: 'DeltaIndia (Admin)',
-                live_code: generateTotp(secret),
                 otpauth: `otpauth://totp/DeltaIndia:Admin?secret=${secret}&issuer=DeltaIndia`
             }));
         }
@@ -1144,26 +1147,7 @@ function startServer() {
                     <div id="2fa-error" style="color: var(--red); font-size: 12px; margin-bottom: 8px; display: none;">Invalid 2FA code. Please check your app.</div>
                 </div>
 
-                <button class="btn-unlock" onclick="submit2FA()" id="btn-verify-2fa" style="margin-bottom: 14px;">Verify 2FA Code ➔</button>
-
-                <!-- 2FA Setup Key & Live Code Helper -->
-                <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; font-size: 12px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;" onclick="toggleTotpHelper()">
-                        <span style="color: #38bdf8; font-weight: 600;">📱 Need 2FA Key or Live Sync?</span>
-                        <span id="totp-helper-arrow" style="font-size: 10px; color: var(--text-dim);">▼</span>
-                    </div>
-                    <div id="totp-helper-content" style="display: none; margin-top: 10px; color: var(--text-dim); line-height: 1.5;">
-                        <p style="margin-bottom: 6px;">Authenticator Secret Key (Base32):</p>
-                        <div style="background: #080b12; padding: 6px 10px; border-radius: 4px; font-family: monospace; color: #34d399; font-weight: 700; display: flex; justify-content: space-between; align-items: center;">
-                            <span id="totp-secret-display">DELTA2FAINXAU777</span>
-                            <button onclick="copy2FASecret()" style="background: #1e293b; color: white; border: none; padding: 2px 6px; border-radius: 4px; font-size: 10px; cursor: pointer;">Copy</button>
-                        </div>
-                        <div style="margin-top: 8px; display: flex; justify-content: space-between; align-items: center;">
-                            <span>Current Live Code (Demo/Admin):</span>
-                            <strong id="totp-live-code" style="color: #38bdf8; font-family: monospace; font-size: 14px;">------</strong>
-                        </div>
-                    </div>
-                </div>
+                <button class="btn-unlock" onclick="submit2FA()" id="btn-verify-2fa">Verify 2FA Code ➔</button>
             </div>
 
             <!-- Step 2: Master Password Entry -->
@@ -1473,7 +1457,6 @@ function startServer() {
                 const app = document.getElementById('terminal-app');
                 if (app) app.style.display = 'none';
                 showAuthStep1();
-                fetchTotpHint();
             } else {
                 document.getElementById('auth-modal').style.display = 'none';
                 const app = document.getElementById('terminal-app');
@@ -1503,38 +1486,6 @@ function startServer() {
         function backTo2FA() {
             pendingTempToken = '';
             showAuthStep1();
-        }
-
-        async function fetchTotpHint() {
-            try {
-                const res = await fetch('/api/auth/totp-hint');
-                const data = await res.json();
-                if (data.secret) {
-                    document.getElementById('totp-secret-display').textContent = data.secret;
-                }
-                if (data.live_code) {
-                    document.getElementById('totp-live-code').textContent = data.live_code;
-                }
-            } catch(e) {}
-        }
-
-        function toggleTotpHelper() {
-            const c = document.getElementById('totp-helper-content');
-            const arr = document.getElementById('totp-helper-arrow');
-            if (c.style.display === 'none') {
-                c.style.display = 'block';
-                arr.textContent = '▲';
-                fetchTotpHint();
-            } else {
-                c.style.display = 'none';
-                arr.textContent = '▼';
-            }
-        }
-
-        function copy2FASecret() {
-            const sec = document.getElementById('totp-secret-display').textContent.trim();
-            navigator.clipboard.writeText(sec);
-            alert('2FA Secret Key copied: ' + sec);
         }
 
         // Submit Step 1: 2FA Code
