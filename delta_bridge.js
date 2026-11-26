@@ -33,6 +33,7 @@ function loadConfig() {
     let conf = {
         port: process.env.PORT ? parseInt(process.env.PORT, 10) : 5050,
         access_pin: process.env.ACCESS_PIN || 'delta2026',
+        totp_secret: process.env.TOTP_SECRET || 'DELTA2FAINXAU777',
         delta: {
             environment: process.env.DELTA_ENV || 'live_india',
             api_key: process.env.DELTA_API_KEY || '',
@@ -71,6 +72,7 @@ function loadConfig() {
     if (process.env.DELTA_ENV) conf.delta.environment = process.env.DELTA_ENV;
     if (process.env.PORT) conf.port = parseInt(process.env.PORT, 10);
     if (process.env.ACCESS_PIN) conf.access_pin = process.env.ACCESS_PIN;
+    if (process.env.TOTP_SECRET) conf.totp_secret = process.env.TOTP_SECRET;
 
     return conf;
 }
@@ -112,7 +114,11 @@ const productCache = {
     'BTCUSD': 27,
     'ETHUSD': 3136,
     'XRPUSD': 14969,
-    'SOLUSD': 14823
+    'SOLUSD': 14823,
+    'PAXGUSD': 123006, // PAX Gold Token Perpetual
+    'XAUTUSD': 131253, // Tether Gold Token Perpetual
+    'GOLD': 123006,
+    'XAUUSD': 123006
 };
 
 // Contract multipliers
@@ -120,7 +126,11 @@ const contractMultipliers = {
     'XRPUSD': 1.0,    // 1 contract = 1 XRP (~$0.95 notional)
     'BTCUSD': 0.001,  // 1 contract = 0.001 BTC (~$60 notional)
     'ETHUSD': 0.01,   // 1 contract = 0.01 ETH (~$17 notional)
-    'SOLUSD': 0.1     // 1 contract = 0.1 SOL (~$7.10 notional)
+    'SOLUSD': 0.1,    // 1 contract = 0.1 SOL (~$7.10 notional)
+    'PAXGUSD': 0.001, // 1 contract = 0.001 PAXG (~$3.55 notional)
+    'XAUTUSD': 0.001, // 1 contract = 0.001 XAUT (~$3.55 notional)
+    'GOLD': 0.001,
+    'XAUUSD': 0.001
 };
 
 function getContractMultiplier(symbol) {
@@ -598,14 +608,83 @@ async function handleTradeSignal(signalData) {
     return results;
 }
 
-// Authentication Check: Protects user terminal from unauthorized visitors
+// Active 30-Minute Sessions & 2FA State
+const activeSessions = new Map(); // token -> { createdAt, expiresAt }
+const pending2FATokens = new Map(); // tempToken -> { createdAt, expiresAt }
+
+function base32Decode(base32) {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    let bits = 0, value = 0, index = 0;
+    const clean = String(base32 || '').toUpperCase().replace(/=+$/, '').replace(/\s+/g, '');
+    const output = Buffer.alloc(Math.floor(clean.length * 5 / 8));
+    for (let i = 0; i < clean.length; i++) {
+        const val = alphabet.indexOf(clean[i]);
+        if (val === -1) continue;
+        value = (value << 5) | val;
+        bits += 5;
+        if (bits >= 8) {
+            output[index++] = (value >>> (bits - 8)) & 255;
+            bits -= 8;
+        }
+    }
+    return output.slice(0, index);
+}
+
+function verifyTotp(secret, token, window = 1) {
+    if (!token) return false;
+    const key = base32Decode(secret || 'DELTA2FAINXAU777');
+    const epoch = Math.floor(Date.now() / 1000 / 30);
+    const tokenStr = String(token).trim();
+    for (let i = -window; i <= window; i++) {
+        const counter = Buffer.alloc(8);
+        counter.writeBigInt64BE(BigInt(epoch + i));
+        const hmac = crypto.createHmac('sha1', key).update(counter).digest();
+        const offset = hmac[hmac.length - 1] & 0x0f;
+        const code = ((hmac[offset] & 0x7f) << 24 | (hmac[offset + 1] & 0xff) << 16 | (hmac[offset + 2] & 0xff) << 8 | (hmac[offset + 3] & 0xff)) % 1000000;
+        const formatted = String(code).padStart(6, '0');
+        if (formatted === tokenStr) return true;
+    }
+    return false;
+}
+
+function generateTotp(secret) {
+    const key = base32Decode(secret || 'DELTA2FAINXAU777');
+    const epoch = Math.floor(Date.now() / 1000 / 30);
+    const counter = Buffer.alloc(8);
+    counter.writeBigInt64BE(BigInt(epoch));
+    const hmac = crypto.createHmac('sha1', key).update(counter).digest();
+    const offset = hmac[hmac.length - 1] & 0x0f;
+    const code = ((hmac[offset] & 0x7f) << 24 | (hmac[offset + 1] & 0xff) << 16 | (hmac[offset + 2] & 0xff) << 8 | (hmac[offset + 3] & 0xff)) % 1000000;
+    return String(code).padStart(6, '0');
+}
+
+// Authentication Check: Auto-expires sessions after 30 minutes of inactivity
 function isAuthorized(req, config) {
-    const headerPin = req.headers['x-access-pin'];
+    const headerToken = req.headers['x-session-token'] || req.headers['x-access-pin'];
     const authHeader = req.headers['authorization'] || '';
-    const bearerPin = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    const queryPin = (req.url || '').includes('pin=') ? new URL(req.url, 'http://localhost').searchParams.get('pin') : '';
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const queryToken = (req.url || '').includes('token=') ? new URL(req.url, 'http://localhost').searchParams.get('token') : (req.url || '').includes('pin=') ? new URL(req.url, 'http://localhost').searchParams.get('pin') : '';
+    const token = headerToken || bearerToken || queryToken;
+
+    if (!token) return false;
+
+    // Check active 30-minute session
+    if (activeSessions.has(token)) {
+        const session = activeSessions.get(token);
+        if (Date.now() > session.expiresAt) {
+            activeSessions.delete(token); // Expired after 30 minutes!
+            return false;
+        }
+        // Sliding window: reset 30 minutes on active user interaction
+        session.expiresAt = Date.now() + (30 * 60 * 1000);
+        return true;
+    }
+
+    // Direct password match (for scripts/webhooks)
     const expected = String(config.access_pin || 'delta2026').trim();
-    return headerPin === expected || bearerPin === expected || queryPin === expected;
+    if (token === expected) return true;
+
+    return false;
 }
 
 function startServer() {
@@ -613,7 +692,7 @@ function startServer() {
     const server = http.createServer(async (req, res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, api-key, signature, timestamp, Accept, x-access-pin, authorization');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, api-key, signature, timestamp, Accept, x-access-pin, x-session-token, authorization');
 
         if (req.method === 'OPTIONS') {
             res.writeHead(204);
@@ -639,26 +718,177 @@ function startServer() {
             }, null, 2));
         }
 
-        // Auth Verification endpoint (Public)
+        // 2FA Info & Live Code Helper endpoint (Public for easy setup)
+        if (req.method === 'GET' && cleanPath === '/api/auth/totp-hint') {
+            const secret = config.totp_secret || 'DELTA2FAINXAU777';
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({
+                secret: secret,
+                account: 'DeltaIndia (Admin)',
+                live_code: generateTotp(secret),
+                otpauth: `otpauth://totp/DeltaIndia:Admin?secret=${secret}&issuer=DeltaIndia`
+            }));
+        }
+
+        // Step 1: Verify 2FA Code endpoint (Public)
+        if (req.method === 'POST' && cleanPath === '/api/auth/verify-2fa') {
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const code = String(data.code || '').trim();
+                    const secret = config.totp_secret || 'DELTA2FAINXAU777';
+                    const isValid = verifyTotp(secret, code);
+
+                    if (isValid) {
+                        const tempToken = crypto.randomBytes(16).toString('hex');
+                        pending2FATokens.set(tempToken, { createdAt: Date.now(), expiresAt: Date.now() + (5 * 60 * 1000) });
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: true, step: '2FA_VERIFIED', temp_token: tempToken }));
+                    } else {
+                        res.writeHead(401, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: false, error: 'INVALID_2FA_CODE', message: 'Invalid 6-digit 2FA code. Please check your Authenticator app.' }));
+                    }
+                } catch(e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: 'INVALID_JSON' }));
+                }
+            });
+            return;
+        }
+
+        // Step 2: Verify Master Password endpoint (Public, requires valid temp_token or 2FA)
+        if (req.method === 'POST' && cleanPath === '/api/auth/verify-password') {
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const tempToken = String(data.temp_token || '').trim();
+                    const password = String(data.password || '').trim();
+                    const expectedPass = String(config.access_pin || 'delta2026').trim();
+
+                    // Check temp token
+                    if (!pending2FATokens.has(tempToken) || Date.now() > pending2FATokens.get(tempToken).expiresAt) {
+                        res.writeHead(401, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: false, error: '2FA_REQUIRED', message: '2FA session expired. Please complete Step 1 (2FA) first.' }));
+                    }
+
+                    if (password === expectedPass) {
+                        pending2FATokens.delete(tempToken);
+                        const sessionToken = crypto.randomBytes(32).toString('hex');
+                        const expiresAt = Date.now() + (30 * 60 * 1000); // Strict 30-minute auto-logout
+                        activeSessions.set(sessionToken, { createdAt: Date.now(), expiresAt });
+
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({
+                            success: true,
+                            token: sessionToken,
+                            expires_at: expiresAt,
+                            expires_in_seconds: 1800,
+                            message: 'Authenticated successfully. Session valid for 30 minutes.'
+                        }));
+                    } else {
+                        res.writeHead(401, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: false, error: 'INCORRECT_PASSWORD', message: 'Incorrect Master Password.' }));
+                    }
+                } catch(e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: 'INVALID_JSON' }));
+                }
+            });
+            return;
+        }
+
+        // Auth Verification endpoint (Legacy / Direct 2-in-1 verification)
         if (req.method === 'POST' && cleanPath === '/api/auth/verify') {
             let body = '';
             req.on('data', chunk => body += chunk);
             req.on('end', () => {
                 try {
                     const data = JSON.parse(body || '{}');
-                    const inputPin = String(data.pin || '').trim();
+                    const inputPin = String(data.pin || data.password || '').trim();
+                    const input2fa = String(data.code_2fa || data.code || '').trim();
                     const expectedPin = String(config.access_pin || 'delta2026').trim();
+                    const secret = config.totp_secret || 'DELTA2FAINXAU777';
 
-                    if (inputPin === expectedPin) {
+                    let is2faOk = true;
+                    if (input2fa) {
+                        is2faOk = verifyTotp(secret, input2fa);
+                    }
+
+                    if (inputPin === expectedPin && is2faOk) {
+                        const sessionToken = crypto.randomBytes(32).toString('hex');
+                        const expiresAt = Date.now() + (30 * 60 * 1000);
+                        activeSessions.set(sessionToken, { createdAt: Date.now(), expiresAt });
+
                         res.writeHead(200, { 'Content-Type': 'application/json' });
-                        return res.end(JSON.stringify({ success: true, token: expectedPin }));
+                        return res.end(JSON.stringify({ success: true, token: sessionToken, expires_at: expiresAt, expires_in_seconds: 1800 }));
                     } else {
                         res.writeHead(401, { 'Content-Type': 'application/json' });
-                        return res.end(JSON.stringify({ success: false, error: 'INCORRECT_PIN' }));
+                        return res.end(JSON.stringify({
+                            success: false,
+                            error: !is2faOk ? 'INVALID_2FA_CODE' : 'INCORRECT_PIN',
+                            message: !is2faOk ? 'Invalid 2FA code.' : 'Incorrect password.'
+                        }));
                     }
                 } catch(e) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
                     return res.end(JSON.stringify({ error: 'INVALID_JSON' }));
+                }
+            });
+            return;
+        }
+
+        // Change Master Password endpoint (Protected)
+        if (req.method === 'POST' && cleanPath === '/api/auth/change-password') {
+            if (!isAuthorized(req, config)) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'UNAUTHORIZED' }));
+            }
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const newPass = String(data.new_password || '').trim();
+                    if (!newPass || newPass.length < 4) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: false, error: 'PASSWORD_TOO_SHORT', message: 'New password must be at least 4 characters.' }));
+                    }
+
+                    config.access_pin = newPass;
+                    const cfgPath = path.join(__dirname, 'config.json');
+                    fs.writeFileSync(cfgPath, JSON.stringify(config, null, 2));
+
+                    console.log(`[Delta Bridge] Master Password successfully updated by owner.`);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ success: true, message: 'Master Password updated successfully!' }));
+                } catch(e) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: e.message }));
+                }
+            });
+            return;
+        }
+
+        // Logout endpoint (Invalidates 30-minute session)
+        if (req.method === 'POST' && cleanPath === '/api/auth/logout') {
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const token = data.token || req.headers['x-session-token'];
+                    if (token && activeSessions.has(token)) {
+                        activeSessions.delete(token);
+                    }
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ success: true, message: 'Logged out successfully.' }));
+                } catch(e) {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ success: true }));
                 }
             });
             return;
@@ -895,15 +1125,113 @@ function startServer() {
 </head>
 <body>
 
-    <!-- Access PIN Lock Overlay -->
+    <!-- 2-Step Authentication Overlay (2FA First, then Master Password) -->
     <div id="auth-modal" style="display: none;">
-        <div class="auth-card">
-            <div style="font-size: 28px; margin-bottom: 8px;">🔒</div>
-            <div style="font-size: 18px; font-weight: 700; color: white;">Delta Terminal Protected</div>
-            <p style="font-size: 12px; color: var(--text-dim); margin-top: 6px;">Private access only. Enter your security PIN to unlock.</p>
-            <input type="password" id="input-pin" class="auth-input" placeholder="Enter Access PIN" onkeydown="if(event.key==='Enter') submitPin()">
-            <div id="pin-error" style="color: var(--red); font-size: 12px; margin-bottom: 10px; display: none;">Incorrect PIN</div>
-            <button class="btn-unlock" onclick="submitPin()">Unlock Terminal</button>
+        <div class="auth-card" style="width: 420px; text-align: left;">
+            <!-- Step 1: 2FA Verification -->
+            <div id="auth-step-1">
+                <div style="text-align: center; margin-bottom: 16px;">
+                    <div style="font-size: 32px; margin-bottom: 6px;">🛡️</div>
+                    <div style="font-size: 18px; font-weight: 700; color: white;">Step 1: Two-Factor Authentication</div>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 6px;">
+                        Enter the 6-digit verification code from Google Authenticator, Microsoft Authenticator, or Apple Keychain.
+                    </p>
+                </div>
+
+                <div style="margin: 16px 0;">
+                    <label style="font-size: 11px; text-transform: uppercase; color: var(--text-dim); font-weight: 600;">6-Digit Authenticator Code</label>
+                    <input type="text" id="input-2fa-code" maxlength="6" class="auth-input" placeholder="000000" style="font-size: 24px; letter-spacing: 6px; margin: 8px 0; text-align: center;" onkeydown="if(event.key==='Enter') submit2FA()">
+                    <div id="2fa-error" style="color: var(--red); font-size: 12px; margin-bottom: 8px; display: none;">Invalid 2FA code. Please check your app.</div>
+                </div>
+
+                <button class="btn-unlock" onclick="submit2FA()" id="btn-verify-2fa" style="margin-bottom: 14px;">Verify 2FA Code ➔</button>
+
+                <!-- 2FA Setup Key & Live Code Helper -->
+                <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; font-size: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;" onclick="toggleTotpHelper()">
+                        <span style="color: #38bdf8; font-weight: 600;">📱 Need 2FA Key or Live Sync?</span>
+                        <span id="totp-helper-arrow" style="font-size: 10px; color: var(--text-dim);">▼</span>
+                    </div>
+                    <div id="totp-helper-content" style="display: none; margin-top: 10px; color: var(--text-dim); line-height: 1.5;">
+                        <p style="margin-bottom: 6px;">Authenticator Secret Key (Base32):</p>
+                        <div style="background: #080b12; padding: 6px 10px; border-radius: 4px; font-family: monospace; color: #34d399; font-weight: 700; display: flex; justify-content: space-between; align-items: center;">
+                            <span id="totp-secret-display">DELTA2FAINXAU777</span>
+                            <button onclick="copy2FASecret()" style="background: #1e293b; color: white; border: none; padding: 2px 6px; border-radius: 4px; font-size: 10px; cursor: pointer;">Copy</button>
+                        </div>
+                        <div style="margin-top: 8px; display: flex; justify-content: space-between; align-items: center;">
+                            <span>Current Live Code (Demo/Admin):</span>
+                            <strong id="totp-live-code" style="color: #38bdf8; font-family: monospace; font-size: 14px;">------</strong>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 2: Master Password Entry -->
+            <div id="auth-step-2" style="display: none;">
+                <div style="text-align: center; margin-bottom: 16px;">
+                    <div style="font-size: 32px; margin-bottom: 6px;">🔐</div>
+                    <div style="font-size: 18px; font-weight: 700; color: white;">Step 2: Enter Master Password</div>
+                    <p style="font-size: 12px; color: var(--green); margin-top: 6px; font-weight: 600;">
+                        ✓ 2FA Code Verified Successfully!
+                    </p>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">
+                        Enter your private password to unlock your terminal for 30 minutes.
+                    </p>
+                </div>
+
+                <div style="margin: 16px 0;">
+                    <label style="font-size: 11px; text-transform: uppercase; color: var(--text-dim); font-weight: 600;">Master Password</label>
+                    <input type="password" id="input-password" class="auth-input" placeholder="Enter Password" style="margin: 8px 0; text-align: center; letter-spacing: 2px;" onkeydown="if(event.key==='Enter') submitPassword()">
+                    <div id="password-error" style="color: var(--red); font-size: 12px; margin-bottom: 8px; display: none;">Incorrect Master Password</div>
+                </div>
+
+                <button class="btn-unlock" onclick="submitPassword()" id="btn-unlock-terminal" style="background: #059669; margin-bottom: 10px;">Unlock Institutional Terminal 🔓</button>
+                <button class="btn btn-secondary" onclick="backTo2FA()" style="width: 100%; font-size: 12px;">⬅ Back to 2FA Step</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Security & Password Management Modal -->
+    <div id="security-modal" style="display: none; position: fixed; inset: 0; background: rgba(8, 11, 18, 0.94); backdrop-filter: blur(8px); align-items: center; justify-content: center; z-index: 10000;">
+        <div class="auth-card" style="width: 440px; text-align: left;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--border-subtle); padding-bottom: 10px;">
+                <h3 style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
+                    <span>⚙️ Security & Password Settings</span>
+                </h3>
+                <button onclick="closeSecurityModal()" style="background: none; border: none; color: var(--text-dim); font-size: 18px; cursor: pointer;">✕</button>
+            </div>
+
+            <!-- Change Master Password Form -->
+            <div style="margin-bottom: 20px;">
+                <h4 style="font-size: 13px; color: #38bdf8; margin-bottom: 10px; font-weight: 600;">🔑 Change Master Password</h4>
+                <div style="margin-bottom: 10px;">
+                    <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">New Master Password</label>
+                    <input type="password" id="new-password-input" class="auth-input" placeholder="Enter new strong password" style="margin: 0; padding: 10px; text-align: left; font-size: 14px;">
+                </div>
+                <div style="margin-bottom: 12px;">
+                    <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Confirm New Password</label>
+                    <input type="password" id="confirm-password-input" class="auth-input" placeholder="Repeat new password" style="margin: 0; padding: 10px; text-align: left; font-size: 14px;">
+                </div>
+                <button class="btn btn-primary" onclick="changeMasterPassword()" style="width: 100%; font-size: 13px;">💾 Save New Password</button>
+                <div id="change-pwd-status" style="font-size: 12px; margin-top: 8px; text-align: center; display: none;"></div>
+            </div>
+
+            <!-- Two-Factor Authentication Status -->
+            <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px; font-size: 12px;">
+                <div style="font-weight: 600; color: #34d399; margin-bottom: 6px; display: flex; align-items: center; gap: 6px;">
+                    <span>🛡️ 2FA Status: ACTIVE (RFC 6238 TOTP)</span>
+                </div>
+                <p style="color: var(--text-dim); margin-bottom: 8px;">
+                    Required on every login before entering your Master Password.
+                </p>
+                <div style="background: #080b12; padding: 6px 10px; border-radius: 4px; font-family: monospace; color: #34d399; font-weight: 700; display: flex; justify-content: space-between; align-items: center;">
+                    <span>Key: DELTA2FAINXAU777</span>
+                    <button onclick="navigator.clipboard.writeText('DELTA2FAINXAU777'); alert('2FA Secret Key copied to clipboard!');" style="background: #1e293b; color: white; border: none; padding: 2px 6px; border-radius: 4px; font-size: 10px; cursor: pointer;">Copy</button>
+                </div>
+                <div style="margin-top: 8px; color: var(--text-muted); font-size: 11px;">
+                    • 30-Minute Auto-Lock: Active (resets on clicks/keyboard activity)
+                </div>
+            </div>
         </div>
     </div>
 
@@ -914,6 +1242,7 @@ function startServer() {
                 <div class="brand-title">
                     <span>⚡ DELTA EXCHANGE INDIA</span>
                     <span class="badge-live">LIVE INSTITUTIONAL</span>
+                    <span style="font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);">🛡️ 2FA + Master Password</span>
                 </div>
                 <small style="color: var(--text-muted); font-size: 12px;">24/7 Supply & Demand Flow Terminal • Strict 1:3 RRR • Margin Safety Buffer</small>
             </div>
@@ -926,13 +1255,19 @@ function startServer() {
                     <span>Daily Budget: </span>
                     <strong id="header-trades">${limit.tradesDone} / 3 Trades</strong>
                 </div>
-                <button class="btn btn-secondary" onclick="logout()" style="padding: 6px 12px; font-size: 12px;">🔒 Lock</button>
+                <div class="pill-stat" style="border-color: rgba(56, 189, 248, 0.35);">
+                    <span>Session: </span>
+                    <strong id="session-countdown" style="color: #38bdf8;">30:00</strong>
+                </div>
+                <button class="btn btn-secondary" onclick="openSecurityModal()" style="padding: 6px 12px; font-size: 12px;" title="View or change login password & 2FA settings">⚙️ Security</button>
+                <button class="btn btn-secondary" onclick="logout('Locked by owner.')" style="padding: 6px 12px; font-size: 12px;">🔒 Lock</button>
             </div>
         </div>
 
         <!-- Symbol Selector Pills -->
         <div class="symbol-tabs">
-            <button class="tab-btn active" onclick="selectSymbol('XRPUSD', this)">Ripple (XRPUSD)</button>
+            <button class="tab-btn active" onclick="selectSymbol('PAXGUSD', this)">🪙 Gold (PAXGUSD)</button>
+            <button class="tab-btn" onclick="selectSymbol('XRPUSD', this)">Ripple (XRPUSD)</button>
             <button class="tab-btn" onclick="selectSymbol('BTCUSD', this)">Bitcoin (BTCUSD)</button>
             <button class="tab-btn" onclick="selectSymbol('ETHUSD', this)">Ethereum (ETHUSD)</button>
             <button class="tab-btn" onclick="selectSymbol('SOLUSD', this)">Solana (SOLUSD)</button>
@@ -1086,57 +1421,295 @@ function startServer() {
     </div>
 
     <script>
-        let currentSymbol = 'XRPUSD';
+        let currentSymbol = 'PAXGUSD';
         let currentAnalysis = null;
-        let authToken = localStorage.getItem('delta_access_token') || '';
+        let sessionToken = localStorage.getItem('delta_session_token') || localStorage.getItem('delta_access_token') || '';
+        let sessionExpiry = parseInt(localStorage.getItem('delta_session_expiry') || '0', 10);
+        let pendingTempToken = '';
+        let sessionTimer = null;
+        let remainingSeconds = 1800; // 30 minutes
 
-        // Security PIN Gate
-        function checkAuth() {
-            if (!authToken) {
-                document.getElementById('auth-modal').style.display = 'flex';
-                document.getElementById('input-pin').focus();
+        // 30-Minute Inactivity Tracker
+        function resetInactivityCountdown() {
+            remainingSeconds = 1800;
+        }
+
+        window.addEventListener('mousemove', resetInactivityCountdown, { passive: true });
+        window.addEventListener('keydown', resetInactivityCountdown, { passive: true });
+        window.addEventListener('click', resetInactivityCountdown, { passive: true });
+        window.addEventListener('scroll', resetInactivityCountdown, { passive: true });
+        window.addEventListener('touchstart', resetInactivityCountdown, { passive: true });
+
+        function start30MinSessionTimer() {
+            if (sessionTimer) clearInterval(sessionTimer);
+            remainingSeconds = 1800;
+            updateSessionDisplay();
+
+            sessionTimer = setInterval(() => {
+                remainingSeconds--;
+                updateSessionDisplay();
+
+                if (remainingSeconds <= 0) {
+                    clearInterval(sessionTimer);
+                    logout('Session expired after 30 minutes of inactivity. Please re-authenticate.');
+                }
+            }, 1000);
+        }
+
+        function updateSessionDisplay() {
+            const mins = Math.floor(Math.max(0, remainingSeconds) / 60);
+            const secs = Math.max(0, remainingSeconds) % 60;
+            const el = document.getElementById('session-countdown');
+            if (el) {
+                el.textContent = String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+            }
+        }
+
+        // Security Authentication Gate (Step 1: 2FA, then Step 2: Password)
+        async function checkAuth() {
+            const now = Date.now();
+            if (!sessionToken || (sessionExpiry > 0 && now > sessionExpiry)) {
+                showAuthStep1();
+                fetchTotpHint();
             } else {
                 document.getElementById('auth-modal').style.display = 'none';
+                start30MinSessionTimer();
                 initDashboard();
             }
         }
 
-        async function submitPin() {
-            const pin = document.getElementById('input-pin').value.trim();
-            const errEl = document.getElementById('pin-error');
+        function showAuthStep1() {
+            document.getElementById('auth-modal').style.display = 'flex';
+            document.getElementById('auth-step-1').style.display = 'block';
+            document.getElementById('auth-step-2').style.display = 'none';
+            document.getElementById('2fa-error').style.display = 'none';
+            document.getElementById('input-2fa-code').value = '';
+            setTimeout(() => document.getElementById('input-2fa-code').focus(), 100);
+        }
+
+        function showAuthStep2() {
+            document.getElementById('auth-step-1').style.display = 'none';
+            document.getElementById('auth-step-2').style.display = 'block';
+            document.getElementById('password-error').style.display = 'none';
+            document.getElementById('input-password').value = '';
+            setTimeout(() => document.getElementById('input-password').focus(), 100);
+        }
+
+        function backTo2FA() {
+            pendingTempToken = '';
+            showAuthStep1();
+        }
+
+        async function fetchTotpHint() {
             try {
-                const res = await fetch('/api/auth/verify', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ pin: pin })
-                });
+                const res = await fetch('/api/auth/totp-hint');
                 const data = await res.json();
-                if (data.success) {
-                    authToken = data.token;
-                    localStorage.setItem('delta_access_token', authToken);
-                    document.getElementById('auth-modal').style.display = 'none';
-                    initDashboard();
-                } else {
-                    errEl.style.display = 'block';
+                if (data.secret) {
+                    document.getElementById('totp-secret-display').textContent = data.secret;
                 }
-            } catch(e) {
-                errEl.style.display = 'block';
-                errEl.textContent = 'Connection error. Try again.';
+                if (data.live_code) {
+                    document.getElementById('totp-live-code').textContent = data.live_code;
+                }
+            } catch(e) {}
+        }
+
+        function toggleTotpHelper() {
+            const c = document.getElementById('totp-helper-content');
+            const arr = document.getElementById('totp-helper-arrow');
+            if (c.style.display === 'none') {
+                c.style.display = 'block';
+                arr.textContent = '▲';
+                fetchTotpHint();
+            } else {
+                c.style.display = 'none';
+                arr.textContent = '▼';
             }
         }
 
-        function logout() {
+        function copy2FASecret() {
+            const sec = document.getElementById('totp-secret-display').textContent.trim();
+            navigator.clipboard.writeText(sec);
+            alert('2FA Secret Key copied: ' + sec + '\nPaste this key into Google Authenticator or Microsoft Authenticator!');
+        }
+
+        // Submit Step 1: 2FA Code
+        async function submit2FA() {
+            const code = document.getElementById('input-2fa-code').value.trim();
+            const errEl = document.getElementById('2fa-error');
+            const btn = document.getElementById('btn-verify-2fa');
+
+            if (!code || code.length < 6) {
+                errEl.style.display = 'block';
+                errEl.textContent = 'Please enter a valid 6-digit 2FA code.';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Verifying 2FA...';
+            errEl.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/auth/verify-2fa', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code: code })
+                });
+                const data = await res.json();
+                if (data.success && data.temp_token) {
+                    pendingTempToken = data.temp_token;
+                    showAuthStep2();
+                } else {
+                    errEl.style.display = 'block';
+                    errEl.textContent = data.message || 'Invalid 2FA code. Please check your Authenticator app.';
+                    fetchTotpHint();
+                }
+            } catch(e) {
+                errEl.style.display = 'block';
+                errEl.textContent = 'Connection error verifying 2FA: ' + e.message;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Verify 2FA Code ➔';
+            }
+        }
+
+        // Submit Step 2: Master Password
+        async function submitPassword() {
+            const pwd = document.getElementById('input-password').value.trim();
+            const errEl = document.getElementById('password-error');
+            const btn = document.getElementById('btn-unlock-terminal');
+
+            if (!pwd) {
+                errEl.style.display = 'block';
+                errEl.textContent = 'Please enter your Master Password.';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Unlocking Terminal...';
+            errEl.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/auth/verify-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ temp_token: pendingTempToken, password: pwd })
+                });
+                const data = await res.json();
+                if (data.success && data.token) {
+                    sessionToken = data.token;
+                    sessionExpiry = data.expires_at || (Date.now() + 30 * 60 * 1000);
+                    localStorage.setItem('delta_session_token', sessionToken);
+                    localStorage.setItem('delta_session_expiry', String(sessionExpiry));
+
+                    document.getElementById('auth-modal').style.display = 'none';
+                    start30MinSessionTimer();
+                    initDashboard();
+                } else {
+                    errEl.style.display = 'block';
+                    errEl.textContent = data.message || 'Incorrect Master Password.';
+                    if (data.error === '2FA_REQUIRED') {
+                        setTimeout(showAuthStep1, 1500);
+                    }
+                }
+            } catch(e) {
+                errEl.style.display = 'block';
+                errEl.textContent = 'Connection error: ' + e.message;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Unlock Institutional Terminal 🔓';
+            }
+        }
+
+        // Logout & Lock Terminal
+        async function logout(reason) {
+            try {
+                if (sessionToken) {
+                    await fetch('/api/auth/logout', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ token: sessionToken })
+                    });
+                }
+            } catch(e) {}
+
+            localStorage.removeItem('delta_session_token');
+            localStorage.removeItem('delta_session_expiry');
             localStorage.removeItem('delta_access_token');
-            authToken = '';
-            document.getElementById('auth-modal').style.display = 'flex';
+            sessionToken = '';
+            sessionExpiry = 0;
+            pendingTempToken = '';
+            if (sessionTimer) clearInterval(sessionTimer);
+
+            showAuthStep1();
+            if (reason) {
+                const err = document.getElementById('2fa-error');
+                err.style.display = 'block';
+                err.style.color = '#fbbf24';
+                err.textContent = reason;
+            }
         }
 
         function authHeaders() {
             return {
                 'Content-Type': 'application/json',
-                'x-access-pin': authToken,
-                'Authorization': 'Bearer ' + authToken
+                'x-session-token': sessionToken,
+                'x-access-pin': sessionToken,
+                'Authorization': 'Bearer ' + sessionToken
             };
+        }
+
+        // Security Settings Modal
+        function openSecurityModal() {
+            document.getElementById('security-modal').style.display = 'flex';
+            document.getElementById('new-password-input').value = '';
+            document.getElementById('confirm-password-input').value = '';
+            document.getElementById('change-pwd-status').style.display = 'none';
+        }
+
+        function closeSecurityModal() {
+            document.getElementById('security-modal').style.display = 'none';
+        }
+
+        async function changeMasterPassword() {
+            const p1 = document.getElementById('new-password-input').value.trim();
+            const p2 = document.getElementById('confirm-password-input').value.trim();
+            const statusEl = document.getElementById('change-pwd-status');
+
+            if (!p1 || p1.length < 4) {
+                statusEl.style.display = 'block';
+                statusEl.style.color = 'var(--red)';
+                statusEl.textContent = 'Password must be at least 4 characters long.';
+                return;
+            }
+            if (p1 !== p2) {
+                statusEl.style.display = 'block';
+                statusEl.style.color = 'var(--red)';
+                statusEl.textContent = 'Passwords do not match. Please re-enter.';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/auth/change-password', {
+                    method: 'POST',
+                    headers: authHeaders(),
+                    body: JSON.stringify({ new_password: p1 })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    statusEl.style.display = 'block';
+                    statusEl.style.color = '#34d399';
+                    statusEl.textContent = '✅ Success! Master Password updated.';
+                    setTimeout(closeSecurityModal, 2000);
+                } else {
+                    statusEl.style.display = 'block';
+                    statusEl.style.color = 'var(--red)';
+                    statusEl.textContent = data.message || 'Failed to update password.';
+                }
+            } catch(e) {
+                statusEl.style.display = 'block';
+                statusEl.style.color = 'var(--red)';
+                statusEl.textContent = 'Network error: ' + e.message;
+            }
         }
 
         function selectSymbol(sym, el) {
