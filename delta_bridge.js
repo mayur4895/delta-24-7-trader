@@ -65,7 +65,8 @@ function loadConfig() {
         },
         risk: {
             max_daily_trades: 3,
-            default_rrr: 3
+            default_rrr: 3,
+            capital_risk_percent: process.env.CAPITAL_RISK_PERCENT ? parseFloat(process.env.CAPITAL_RISK_PERCENT) : 5.0
         }
     };
 
@@ -528,9 +529,24 @@ async function handleTradeSignal(signalData) {
     const multiplier = getContractMultiplier(signalData.symbol || 'XRPUSD');
     const entryPrice = filterResult.trade_details.entry_price;
     const stopLoss = filterResult.trade_details.stop_loss;
-    const lotSize = filterResult.trade_details.size;
     let leverage = parseInt(signalData.leverage || 10);
     const clientBalance = parseFloat(signalData.account_balance || 0);
+    const riskPct = (config.risk && config.risk.capital_risk_percent) ? parseFloat(config.risk.capital_risk_percent) : 5.0;
+
+    let lotSize = parseInt(signalData.size || 1, 10);
+    const riskDistance = Math.abs(entryPrice - stopLoss);
+    const riskPerContract = riskDistance * multiplier;
+
+    // Dynamic lot sizing targeting 4% to 5% risk on capital
+    if (clientBalance > 0 && riskPerContract > 0 && !signalData.fixed_size) {
+        const allowedRiskUsd = clientBalance * (riskPct / 100);
+        const dynamicLots = Math.floor(allowedRiskUsd / riskPerContract);
+        lotSize = Math.max(1, dynamicLots);
+        filterResult.trade_details.size = lotSize;
+        if (filterResult.delta_exchange_payload) {
+            filterResult.delta_exchange_payload.size = lotSize;
+        }
+    }
 
     const notionalValue = lotSize * entryPrice * multiplier;
     
@@ -557,6 +573,8 @@ async function handleTradeSignal(signalData) {
         notional_value_usd: parseFloat(notionalValue.toFixed(2)),
         leverage: `${leverage}x`,
         adaptive_leverage: adaptiveInfo,
+        capital_risk_percent: `${riskPct}%`,
+        target_risk_usd: parseFloat((clientBalance * (riskPct / 100)).toFixed(2)),
         required_margin_usd: parseFloat(requiredMargin.toFixed(2)),
         dollar_risk_1r: parseFloat(dollarRisk1R.toFixed(2)),
         dollar_reward_3r: parseFloat(dollarReward3R.toFixed(2)),
@@ -964,6 +982,51 @@ function startServer() {
             return;
         }
 
+        // Change Viewer / Delta Default Password endpoint (Protected: Master Admin Only)
+        if (req.method === 'POST' && cleanPath === '/api/auth/change-viewer-password') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Master Admin privileges required to change security settings.' }));
+            }
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const newPass = String(data.new_password || '').trim();
+                    if (!newPass || newPass.length < 4) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: false, error: 'PASSWORD_TOO_SHORT', message: 'New password must be at least 4 characters.' }));
+                    }
+
+                    const newHash = bcrypt.hashSync(newPass, 10);
+                    config.viewer_password_hash = newHash;
+                    config.viewer_password_hashes = [newHash];
+
+                    try {
+                        const cfgPath = path.join(__dirname, 'config.json');
+                        let curCfg = {};
+                        if (fs.existsSync(cfgPath)) {
+                            curCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+                        }
+                        curCfg.viewer_password_hash = newHash;
+                        curCfg.viewer_password_hashes = [newHash];
+                        fs.writeFileSync(cfgPath, JSON.stringify(curCfg, null, 2));
+                    } catch(err) {
+                        console.error('[Delta Bridge] Error writing config.json:', err.message);
+                    }
+
+                    console.log(`[Delta Bridge] Viewer / Delta default password bcrypt hash updated by Master Admin.`);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ success: true, message: 'Viewer / Delta default password updated successfully!' }));
+                } catch(e) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: e.message }));
+                }
+            });
+            return;
+        }
+
         // Logout endpoint (Invalidates 30-minute session)
         if (req.method === 'POST' && cleanPath === '/api/auth/logout') {
             let body = '';
@@ -1293,7 +1356,7 @@ function startServer() {
 
     <!-- Security & Password Management Modal -->
     <div id="security-modal" style="display: none; position: fixed; inset: 0; background: rgba(8, 11, 18, 0.94); backdrop-filter: blur(8px); align-items: center; justify-content: center; z-index: 10000;">
-        <div class="auth-card" style="width: 440px; text-align: left;">
+        <div class="auth-card" style="width: 450px; max-height: 90vh; overflow-y: auto; text-align: left;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--border-subtle); padding-bottom: 10px;">
                 <h3 style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
                     <span>⚙️ Security & Password Settings</span>
@@ -1303,17 +1366,42 @@ function startServer() {
 
             <!-- Change Master Password Form -->
             <div style="margin-bottom: 20px;">
-                <h4 style="font-size: 13px; color: #38bdf8; margin-bottom: 10px; font-weight: 600;">🔑 Change Master Password</h4>
+                <h4 style="font-size: 13px; color: #38bdf8; margin-bottom: 10px; font-weight: 600;">🔑 Change Master Admin Password</h4>
                 <div style="margin-bottom: 10px;">
                     <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">New Master Password</label>
-                    <input type="password" id="new-password-input" class="auth-input" placeholder="Enter new strong password" style="margin: 0; padding: 10px; text-align: left; font-size: 14px;">
+                    <input type="password" id="new-password-input" class="auth-input" placeholder="Enter new strong master password" style="margin: 0; padding: 10px; text-align: left; font-size: 14px;">
                 </div>
                 <div style="margin-bottom: 12px;">
                     <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Confirm New Password</label>
-                    <input type="password" id="confirm-password-input" class="auth-input" placeholder="Repeat new password" style="margin: 0; padding: 10px; text-align: left; font-size: 14px;">
+                    <input type="password" id="confirm-password-input" class="auth-input" placeholder="Repeat new master password" style="margin: 0; padding: 10px; text-align: left; font-size: 14px;">
                 </div>
-                <button class="btn btn-primary" onclick="changeMasterPassword()" style="width: 100%; font-size: 13px;">💾 Save New Password</button>
+                <button class="btn btn-primary" onclick="changeMasterPassword()" style="width: 100%; font-size: 13px;">💾 Save Master Password</button>
                 <div id="change-pwd-status" style="font-size: 12px; margin-top: 8px; text-align: center; display: none;"></div>
+            </div>
+
+            <!-- Change Viewer / Delta Default Password Form -->
+            <div style="margin-bottom: 20px; border-top: 1px solid var(--border-subtle); padding-top: 16px;">
+                <h4 style="font-size: 13px; color: #34d399; margin-bottom: 10px; font-weight: 600;">👁️ Change Delta Default / Viewer Password</h4>
+                <div style="margin-bottom: 10px;">
+                    <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">New Viewer Password</label>
+                    <input type="password" id="new-viewer-password-input" class="auth-input" placeholder="Enter new viewer password (e.g. delta2025)" style="margin: 0; padding: 10px; text-align: left; font-size: 14px;">
+                </div>
+                <div style="margin-bottom: 12px;">
+                    <label style="font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 4px;">Confirm Viewer Password</label>
+                    <input type="password" id="confirm-viewer-password-input" class="auth-input" placeholder="Repeat viewer password" style="margin: 0; padding: 10px; text-align: left; font-size: 14px;">
+                </div>
+                <button class="btn btn-secondary" onclick="changeViewerPassword()" style="width: 100%; font-size: 13px; border-color: #059669; color: #34d399;">💾 Save Viewer Password</button>
+                <div id="change-viewer-pwd-status" style="font-size: 12px; margin-top: 8px; text-align: center; display: none;"></div>
+            </div>
+
+            <!-- Risk Management Policy (4% to 5% Equity Risk) -->
+            <div style="margin-bottom: 20px; border-top: 1px solid var(--border-subtle); padding-top: 16px;">
+                <h4 style="font-size: 13px; color: #f59e0b; margin-bottom: 8px; font-weight: 600;">⚖️ Capital Risk Management (4% - 5%)</h4>
+                <div style="background: var(--bg-surface); padding: 10px 12px; border-radius: 6px; font-size: 12px; line-height: 1.6; color: var(--text-dim);">
+                    <div>• Risk on Capital: <strong style="color: #f59e0b;">5.0% per trade</strong></div>
+                    <div>• Target RRR: <strong style="color: #34d399;">Strict 1:3 Reward-to-Risk</strong></div>
+                    <div>• Max Daily Limit: <strong style="color: white;">3 Trades Max (Calendar Day)</strong></div>
+                </div>
             </div>
 
             <!-- Two-Factor Authentication Status -->
@@ -1345,7 +1433,7 @@ function startServer() {
                     <span class="badge-live">LIVE INSTITUTIONAL</span>
                     <span id="user-role-badge" style="font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);">🛡️ 2FA + Master Password</span>
                 </div>
-                <small style="color: var(--text-muted); font-size: 12px;">24/7 Supply & Demand Flow Terminal • Strict 1:3 RRR • Margin Safety Buffer</small>
+                <small style="color: var(--text-muted); font-size: 12px;">24/7 Supply & Demand Flow Terminal • Strict 1:3 RRR • 5% Capital Risk Guard</small>
             </div>
             <div class="header-meta">
                 <div class="pill-stat" id="pill-balance">
@@ -1798,6 +1886,12 @@ function startServer() {
             document.getElementById('new-password-input').value = '';
             document.getElementById('confirm-password-input').value = '';
             document.getElementById('change-pwd-status').style.display = 'none';
+            const vp1 = document.getElementById('new-viewer-password-input');
+            const vp2 = document.getElementById('confirm-viewer-password-input');
+            if (vp1) vp1.value = '';
+            if (vp2) vp2.value = '';
+            const vStat = document.getElementById('change-viewer-pwd-status');
+            if (vStat) vStat.style.display = 'none';
         }
 
         function closeSecurityModal() {
@@ -1832,12 +1926,54 @@ function startServer() {
                 if (data.success) {
                     statusEl.style.display = 'block';
                     statusEl.style.color = '#34d399';
-                    statusEl.textContent = '✅ Success! Master Password updated.';
+                    statusEl.textContent = '✅ Success! Master Admin Password updated.';
                     setTimeout(closeSecurityModal, 2000);
                 } else {
                     statusEl.style.display = 'block';
                     statusEl.style.color = 'var(--red)';
                     statusEl.textContent = data.message || 'Failed to update password.';
+                }
+            } catch(e) {
+                statusEl.style.display = 'block';
+                statusEl.style.color = 'var(--red)';
+                statusEl.textContent = 'Network error: ' + e.message;
+            }
+        }
+
+        async function changeViewerPassword() {
+            const p1 = document.getElementById('new-viewer-password-input').value.trim();
+            const p2 = document.getElementById('confirm-viewer-password-input').value.trim();
+            const statusEl = document.getElementById('change-viewer-pwd-status');
+
+            if (!p1 || p1.length < 4) {
+                statusEl.style.display = 'block';
+                statusEl.style.color = 'var(--red)';
+                statusEl.textContent = 'Password must be at least 4 characters long.';
+                return;
+            }
+            if (p1 !== p2) {
+                statusEl.style.display = 'block';
+                statusEl.style.color = 'var(--red)';
+                statusEl.textContent = 'Passwords do not match. Please re-enter.';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/auth/change-viewer-password', {
+                    method: 'POST',
+                    headers: authHeaders(),
+                    body: JSON.stringify({ new_password: p1 })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    statusEl.style.display = 'block';
+                    statusEl.style.color = '#34d399';
+                    statusEl.textContent = '✅ Success! Viewer / Delta Default Password updated.';
+                    setTimeout(closeSecurityModal, 2000);
+                } else {
+                    statusEl.style.display = 'block';
+                    statusEl.style.color = 'var(--red)';
+                    statusEl.textContent = data.message || 'Failed to update viewer password.';
                 }
             } catch(e) {
                 statusEl.style.display = 'block';
