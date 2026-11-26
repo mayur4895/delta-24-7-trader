@@ -22,6 +22,14 @@ const bcrypt = require('bcryptjs');
 const { processSignal, checkDailyLimit, loadTradeState, saveTradeState } = require('./signal_filter');
 const { checkNewsLockout } = require('./modules/news_filter');
 const { fetchCoinGlassIntelligence, evaluateLiquidityConfluence } = require('./modules/coinglass_extractor');
+const { 
+    initWhatsApp,
+    sendWhatsAppTradeAlert, 
+    sendTestWhatsAppAlert, 
+    getWhatsAppStatus,
+    formatTradeAlertMessage, 
+    DEFAULT_RECIPIENTS 
+} = require('./modules/whatsapp_notifier');
 
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 let activeScanner = null;
@@ -67,6 +75,17 @@ function loadConfig() {
             max_daily_trades: 3,
             default_rrr: 3,
             capital_risk_percent: process.env.CAPITAL_RISK_PERCENT ? parseFloat(process.env.CAPITAL_RISK_PERCENT) : 5.0
+        },
+        whatsapp: {
+            enabled: true,
+            recipients: [
+                { phone: '+918855964895', name: 'Admin (8855964895)' },
+                { phone: '+919022713613', name: 'Admin (9022713613)' }
+            ],
+            callmebot_keys: {
+                '918855964895': process.env.CALLMEBOT_KEY_918855964895 || '',
+                '919022713613': process.env.CALLMEBOT_KEY_919022713613 || ''
+            }
         }
     };
 
@@ -77,7 +96,8 @@ function loadConfig() {
                 ...conf,
                 ...fileConf,
                 delta: { ...conf.delta, ...(fileConf.delta || {}) },
-                risk: { ...conf.risk, ...(fileConf.risk || {}) }
+                risk: { ...conf.risk, ...(fileConf.risk || {}) },
+                whatsapp: { ...conf.whatsapp, ...(fileConf.whatsapp || {}) }
             };
         } catch (e) {}
     }
@@ -633,6 +653,28 @@ async function handleTradeSignal(signalData) {
             });
             results.verdict = 'EXECUTED';
             results.order_id = orderRes.response?.result?.id || 'SUBMITTED';
+
+            // Automatic WhatsApp Alert to 8855964895 and 9022713613
+            try {
+                const waRes = await sendWhatsAppTradeAlert({
+                    symbol: signalData.symbol || 'XRPUSD',
+                    direction: (filterResult.trade_details.side === 'BUY' || signalData.side === 'BUY' || signalData.direction === 'LONG') ? 'LONG' : 'SHORT',
+                    side: filterResult.trade_details.side,
+                    entry_price: filterResult.trade_details.entry_price,
+                    stop_loss: filterResult.trade_details.stop_loss,
+                    take_profit: filterResult.trade_details.take_profit,
+                    rrr: filterResult.trade_details.rrr || '1:3',
+                    size: filterResult.trade_details.size,
+                    capital_risk_percent: `${riskPct}%`,
+                    order_type: signalData.order_type === 'limit' ? 'Resting Limit' : 'Market',
+                    order_id: results.order_id,
+                    entry_time: orderRes.response?.result?.created_at || filterResult.trade_details.timestamp_utc || new Date().toISOString()
+                }, config);
+                results.whatsapp_alert = waRes;
+                console.log(`[Delta Bridge] Automatic WhatsApp alert triggered for ${signalData.symbol}`);
+            } catch(waErr) {
+                console.error('[Delta Bridge] WhatsApp alert trigger error:', waErr.message);
+            }
         } else {
             results.verdict = 'FAILED_ON_EXCHANGE';
             results.reject_reason = orderRes.response?.error?.code || orderRes.error || 'ORDER_REJECTED';
@@ -1048,6 +1090,40 @@ function startServer() {
             return;
         }
 
+        // WhatsApp Status & Live QR Code endpoint (Master Admin Only)
+        if (req.method === 'GET' && cleanPath === '/api/whatsapp/status') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'WhatsApp controls restricted to Master Admin.' }));
+            }
+            const status = getWhatsAppStatus();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify(status));
+        }
+
+        // WhatsApp Test Alert endpoint (Master Admin Only)
+        if (req.method === 'POST' && cleanPath === '/api/whatsapp/test') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'WhatsApp controls restricted to Master Admin.' }));
+            }
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', async () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const sym = data.symbol || 'PAXGUSD';
+                    const resTest = await sendTestWhatsAppAlert(sym);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify(resTest));
+                } catch(e) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: e.message }));
+                }
+            });
+            return;
+        }
+
         // Security check for protected API routes
         if (cleanPath.startsWith('/api/') || cleanPath === '/webhook' || cleanPath === '/reset-counter') {
             if (!isAuthorized(req, config)) {
@@ -1405,7 +1481,7 @@ function startServer() {
             </div>
 
             <!-- Two-Factor Authentication Status -->
-            <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px; font-size: 12px;">
+            <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px; font-size: 12px; margin-bottom: 20px;">
                 <div style="font-weight: 600; color: #34d399; margin-bottom: 6px; display: flex; align-items: center; gap: 6px;">
                     <span>🛡️ 2FA Status: ACTIVE (RFC 6238 TOTP)</span>
                 </div>
@@ -1419,6 +1495,40 @@ function startServer() {
                 <div style="margin-top: 8px; color: var(--text-muted); font-size: 11px;">
                     • 30-Minute Auto-Lock: Active (resets on clicks/keyboard activity)
                 </div>
+            </div>
+
+            <!-- WhatsApp Automatic Trade Alerts (Linked Device) -->
+            <div style="margin-bottom: 10px; border-top: 1px solid var(--border-subtle); padding-top: 16px;">
+                <h4 style="font-size: 13px; color: #25d366; margin-bottom: 8px; font-weight: 600; display: flex; align-items: center; justify-content: space-between;">
+                    <span>📱 WhatsApp Automatic Trade Alerts</span>
+                    <span id="wa-status-badge" style="font-size: 10px; background: rgba(234, 179, 8, 0.15); color: #eab308; border: 1px solid rgba(234, 179, 8, 0.3); padding: 2px 6px; border-radius: 4px;">INITIALIZING...</span>
+                </h4>
+                <div style="background: var(--bg-surface); padding: 10px 12px; border-radius: 6px; font-size: 12px; line-height: 1.5; color: var(--text-dim); margin-bottom: 12px;">
+                    <div>• <strong>Recipients:</strong> <span style="color: white; font-family: monospace;">+91 8855964895</span> & <span style="color: white; font-family: monospace;">+91 9022713613</span></div>
+                    <div>• <strong>Trigger:</strong> Sends automatically whenever a trade is executed across all assets</div>
+                </div>
+
+                <!-- QR Container for linking WhatsApp -->
+                <div id="wa-qr-container" style="text-align: center; padding: 14px; background: #080b12; border: 1px dashed rgba(37, 211, 102, 0.4); border-radius: 8px; margin-bottom: 12px;">
+                    <div style="font-size: 12px; color: #34d399; font-weight: 600; margin-bottom: 4px;">📲 Scan with WhatsApp to Link Device:</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 10px;">
+                        Open WhatsApp → <strong>Linked Devices</strong> → <strong>Link a Device</strong> → Scan QR code
+                    </div>
+                    <img id="wa-qr-image" src="" alt="WhatsApp QR Code" style="width: 180px; height: 180px; border-radius: 6px; background: white; padding: 6px; display: none; margin: 0 auto 8px auto;" />
+                    <div id="wa-qr-loading" style="font-size: 11px; color: var(--text-dim); padding: 25px 0;">⏳ Generating live QR code...</div>
+                </div>
+
+                <!-- Connected Box (shown when linked) -->
+                <div id="wa-connected-container" style="display: none; background: rgba(37, 211, 102, 0.1); border: 1px solid rgba(37, 211, 102, 0.3); border-radius: 6px; padding: 12px; text-align: center; margin-bottom: 12px;">
+                    <div style="color: #25d366; font-weight: 600; font-size: 13px; margin-bottom: 4px;">✅ WhatsApp Connected & Active</div>
+                    <div id="wa-connected-phone" style="font-size: 12px; color: white; font-family: monospace;">Linked Account</div>
+                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Automatic trade alerts will be delivered directly to 8855964895 and 9022713613</div>
+                </div>
+
+                <button class="btn btn-primary" onclick="sendTestWhatsAppAlert()" style="width: 100%; font-size: 12px; background: #059669;">
+                    📱 Send Test Trade Alert to WhatsApp
+                </button>
+                <div id="wa-test-status" style="font-size: 11px; margin-top: 8px; text-align: center; display: none;"></div>
             </div>
         </div>
     </div>
@@ -1880,6 +1990,80 @@ function startServer() {
             };
         }
 
+        let waStatusInterval = null;
+        async function fetchWhatsAppStatus() {
+            try {
+                const res = await fetch('/api/whatsapp/status', { headers: authHeaders() });
+                const data = await res.json();
+                const badge = document.getElementById('wa-status-badge');
+                const qrContainer = document.getElementById('wa-qr-container');
+                const connectedContainer = document.getElementById('wa-connected-container');
+                const qrImg = document.getElementById('wa-qr-image');
+                const qrLoading = document.getElementById('wa-qr-loading');
+                const connPhone = document.getElementById('wa-connected-phone');
+
+                if (data.is_connected) {
+                    if (badge) {
+                        badge.style.background = 'rgba(37, 211, 102, 0.15)';
+                        badge.style.color = '#25d366';
+                        badge.style.borderColor = 'rgba(37, 211, 102, 0.3)';
+                        badge.textContent = 'CONNECTED';
+                    }
+                    if (qrContainer) qrContainer.style.display = 'none';
+                    if (connectedContainer) connectedContainer.style.display = 'block';
+                    if (connPhone) connPhone.textContent = 'Linked Account: +' + (data.connected_user || 'Active');
+                } else {
+                    if (badge) {
+                        badge.style.background = 'rgba(234, 179, 8, 0.15)';
+                        badge.style.color = '#eab308';
+                        badge.style.borderColor = 'rgba(234, 179, 8, 0.3)';
+                        badge.textContent = 'SCAN QR CODE';
+                    }
+                    if (qrContainer) qrContainer.style.display = 'block';
+                    if (connectedContainer) connectedContainer.style.display = 'none';
+
+                    if (data.qr_code) {
+                        if (qrImg) {
+                            qrImg.src = data.qr_code;
+                            qrImg.style.display = 'block';
+                        }
+                        if (qrLoading) qrLoading.style.display = 'none';
+                    } else {
+                        if (qrImg) qrImg.style.display = 'none';
+                        if (qrLoading) {
+                            qrLoading.style.display = 'block';
+                            qrLoading.textContent = data.status_text || 'Generating live QR code...';
+                        }
+                    }
+                }
+            } catch(e) {}
+        }
+
+        async function sendTestWhatsAppAlert() {
+            const statusEl = document.getElementById('wa-test-status');
+            statusEl.style.display = 'block';
+            statusEl.style.color = '#38bdf8';
+            statusEl.textContent = '⏳ Sending test trade alert to 8855964895 & 9022713613...';
+            try {
+                const res = await fetch('/api/whatsapp/test', {
+                    method: 'POST',
+                    headers: authHeaders(),
+                    body: JSON.stringify({ symbol: currentSymbol || 'PAXGUSD' })
+                });
+                const data = await res.json();
+                if (data.is_connected) {
+                    statusEl.style.color = '#34d399';
+                    statusEl.textContent = '✅ Success! Test trade alert delivered to 8855964895 and 9022713613.';
+                } else {
+                    statusEl.style.color = '#eab308';
+                    statusEl.innerHTML = '⚠️ WhatsApp not linked yet. Please scan the QR code above to link your device!<br><a href="' + (data.recipients?.[0]?.wa_link || '#') + '" target="_blank" style="color: #25d366; text-decoration: underline;">Click here to preview message format</a>';
+                }
+            } catch(e) {
+                statusEl.style.color = 'var(--red)';
+                statusEl.textContent = 'Error: ' + e.message;
+            }
+        }
+
         // Security Settings Modal
         function openSecurityModal() {
             document.getElementById('security-modal').style.display = 'flex';
@@ -1892,10 +2076,20 @@ function startServer() {
             if (vp2) vp2.value = '';
             const vStat = document.getElementById('change-viewer-pwd-status');
             if (vStat) vStat.style.display = 'none';
+            const waStat = document.getElementById('wa-test-status');
+            if (waStat) waStat.style.display = 'none';
+
+            fetchWhatsAppStatus();
+            if (waStatusInterval) clearInterval(waStatusInterval);
+            waStatusInterval = setInterval(fetchWhatsAppStatus, 3000);
         }
 
         function closeSecurityModal() {
             document.getElementById('security-modal').style.display = 'none';
+            if (waStatusInterval) {
+                clearInterval(waStatusInterval);
+                waStatusInterval = null;
+            }
         }
 
         async function changeMasterPassword() {
@@ -2273,6 +2467,8 @@ function startServer() {
         console.log(`[Delta Bridge] Access PIN: ${config.access_pin || 'delta2026'}`);
         console.log(`[Delta Bridge] Health Check: http://localhost:${PORT}/health`);
         console.log(`[Delta Bridge] Dashboard: http://localhost:${PORT}`);
+        // Initialize WhatsApp Linked Device Engine
+        initWhatsApp();
     });
 
     return server;

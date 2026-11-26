@@ -21,6 +21,7 @@ const {
     getProductId,
     getContractMultiplier 
 } = require('./delta_bridge');
+const { sendWhatsAppSetupFormingAlert } = require('./modules/whatsapp_notifier');
 
 class StrategyScanner {
     constructor(options = {}) {
@@ -334,6 +335,21 @@ class StrategyScanner {
                 await this.executeStrategySignal(analysis.targetZone, analysis.candleClose);
             } else if (analysis.targetZone) {
                 this.logMessage(`[TARGET] ${analysis.targetZone.type}: $${analysis.targetZone.entryLimit} (SL: $${analysis.targetZone.sl} | TP: $${analysis.targetZone.tp}) | Distance: ${analysis.targetZone.distancePct}%`);
+                // Automatic Pre-Trade Reminder on WhatsApp (Setup Forming)
+                try {
+                    await sendWhatsAppSetupFormingAlert({
+                        symbol: this.symbol,
+                        side: analysis.targetZone.side,
+                        direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
+                        entry: analysis.targetZone.entryLimit,
+                        sl: analysis.targetZone.sl,
+                        tp: analysis.targetZone.tp,
+                        livePrice: analysis.livePrice,
+                        distancePct: analysis.targetZone.distancePct
+                    });
+                } catch (waErr) {
+                    console.error('[Scanner] WhatsApp Setup Alert Error:', waErr.message);
+                }
             } else {
                 this.logMessage(`[STATUS] No fresh unmitigated zones in immediate window. Standing by for next 15M candle.`);
             }

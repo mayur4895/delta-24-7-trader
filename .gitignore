@@ -6,6 +6,8 @@ config.json
 
 # Local state
 daily_trades.json
+auth_info_baileys/
+baileys_auth_info/
 
 # Node dependencies and logs
 node_modules/
