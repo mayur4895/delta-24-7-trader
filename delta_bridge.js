@@ -2453,7 +2453,7 @@ function startServer() {
                                 'Login: ' + s.login_time_ist + ' • Active: <span style="color: #38bdf8;">' + s.last_active + '</span> • Auto-lock: ' + s.expires_in_minutes + 'm left' +
                             '</div>' +
                         '</div>' +
-                        (!isCurrent ? '<button onclick="terminateSession(&quot;' + s.id + '&quot;)" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; white-space: nowrap;" title="Forcibly logout this session">🚪 Logout</button>' : '') +
+                        (!isCurrent ? '<button onclick="terminateSession(&quot;' + s.id + '&quot;, &quot;' + s.role + '&quot;)" style="background: rgba(239, 68, 68, 0.2); border: 1px solid #ef4444; color: #fca5a5; padding: 6px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 4px;" title="Logout this single user"><span>🚪</span> Logout User</button>' : '<span style="color: var(--text-muted); font-size: 10px; font-style: italic; white-space: nowrap; background: rgba(255,255,255,0.04); padding: 4px 8px; border-radius: 4px;">(Your Browser)</span>') +
                     '</div>';
                 });
                 listEl.innerHTML = html;
@@ -2493,8 +2493,9 @@ function startServer() {
             }
         }
 
-        async function terminateSession(sessionId) {
-            if (!confirm('Are you sure you want to forcibly logout this session? The user on that device will be locked out immediately.')) return;
+        async function terminateSession(sessionId, roleName) {
+            const roleDesc = roleName === 'VIEWER' ? 'Viewer' : (roleName === 'ADMIN' ? 'Admin' : 'User');
+            if (!confirm('Are you sure you want to log out this single ' + roleDesc + ' session? This will immediately disconnect only this single user.')) return;
             try {
                 const res = await fetch('/api/auth/terminate-session', {
                     method: 'POST',
@@ -2503,7 +2504,7 @@ function startServer() {
                 });
                 const data = await res.json();
                 if (data.success) {
-                    alert('Session successfully terminated. Device logged out.');
+                    alert('Single user (' + roleDesc + ') was successfully logged out!');
                     fetchActiveSessions();
                 } else {
                     alert('Error: ' + data.message);
