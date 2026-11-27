@@ -848,7 +848,7 @@ function startServer() {
                 uptime_seconds: Math.floor(process.uptime()),
                 scanner_active: activeScanner ? activeScanner.isRunning : false,
                 trades_today: limit.tradesDone,
-                max_trades: 3,
+                max_trades: 'unlimited',
                 environment: config.delta.environment,
                 timestamp: new Date().toISOString()
             }, null, 2));
@@ -1281,7 +1281,7 @@ function startServer() {
             const today = new Date().toISOString().slice(0, 10);
             saveTradeState({ current_date: today, trades_today: 0, history: [] });
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ status: 'RESET_SUCCESS', trades_today: 0, max_trades: 3 }));
+            return res.end(JSON.stringify({ status: 'RESET_SUCCESS', trades_today: 0, max_trades: 'unlimited' }));
         }
 
         // Dashboard (HTML)
