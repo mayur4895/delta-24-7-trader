@@ -1713,7 +1713,7 @@ function startServer() {
             </div>
 
             <!-- Active 2FA Logins & Connected Devices -->
-            <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px; font-size: 12px; margin-bottom: 20px;">
+            <div id="active-logins-section" style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px; font-size: 12px; margin-bottom: 20px;">
                 <div style="font-weight: 600; color: #38bdf8; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
                     <span style="display: flex; align-items: center; gap: 6px;">👥 Active Logins & Connected Devices</span>
                     <div style="display: flex; align-items: center; gap: 6px;">
@@ -2040,13 +2040,17 @@ function startServer() {
 
             const pillBal = document.getElementById('pill-balance');
             const pillBud = document.getElementById('pill-budget');
+            const pillActive = document.getElementById('pill-active-users');
             const btnSec = document.getElementById('btn-security-settings');
             const btnLock = document.getElementById('btn-lock');
             const roleBadge = document.getElementById('user-role-badge');
+            const activeLoginsSec = document.getElementById('active-logins-section');
 
             if (pillBal) pillBal.style.display = isAdmin ? 'inline-flex' : 'none';
             if (pillBud) pillBud.style.display = isAdmin ? 'inline-flex' : 'none';
+            if (pillActive) pillActive.style.display = isAdmin ? 'inline-flex' : 'none';
             if (btnSec) btnSec.style.display = isAdmin ? 'inline-flex' : 'none';
+            if (activeLoginsSec) activeLoginsSec.style.display = isAdmin ? 'block' : 'none';
             if (btnLock) {
                 btnLock.style.display = 'inline-flex';
                 btnLock.textContent = isAdmin ? '🔒 Lock' : '🚪 Exit';
@@ -2404,6 +2408,7 @@ function startServer() {
         let activeSessionsInterval = null;
 
         async function fetchActiveSessions() {
+            if (userRole !== 'ADMIN') return;
             try {
                 const res = await fetch('/api/auth/active-sessions', {
                     headers: authHeaders()
@@ -2543,6 +2548,10 @@ function startServer() {
 
         // Security Settings Modal
         function openSecurityModal() {
+            if (userRole !== 'ADMIN') {
+                alert('Access Denied: Security settings and active user monitor are restricted strictly to Master Admin.');
+                return;
+            }
             document.getElementById('security-modal').style.display = 'flex';
             document.getElementById('new-password-input').value = '';
             document.getElementById('confirm-password-input').value = '';
