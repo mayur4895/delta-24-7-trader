@@ -2448,7 +2448,7 @@ function startServer() {
                                 'Login: ' + s.login_time_ist + ' • Active: <span style="color: #38bdf8;">' + s.last_active + '</span> • Auto-lock: ' + s.expires_in_minutes + 'm left' +
                             '</div>' +
                         '</div>' +
-                        (!isCurrent ? '<button onclick="terminateSession(\'' + s.id + '\')" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; white-space: nowrap;" title="Forcibly logout this session">🚪 Logout</button>' : '') +
+                        (!isCurrent ? '<button onclick="terminateSession(&quot;' + s.id + '&quot;)" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; white-space: nowrap;" title="Forcibly logout this session">🚪 Logout</button>' : '') +
                     '</div>';
                 });
                 listEl.innerHTML = html;
@@ -2940,7 +2940,11 @@ function startServer() {
     </script>
 </body>
 </html>`;
-            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.writeHead(200, {
+                'Content-Type': 'text/html',
+                'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+                'Pragma': 'no-cache'
+            });
             return res.end(html);
         }
 
