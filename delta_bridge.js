@@ -688,8 +688,64 @@ async function handleTradeSignal(signalData) {
 }
 
 // Active 30-Minute Sessions & 2FA State
-const activeSessions = new Map(); // token -> { role: 'ADMIN' | 'VIEWER', createdAt, expiresAt }
-const pending2FATokens = new Map(); // tempToken -> { createdAt, expiresAt }
+const activeSessions = new Map(); // token -> { id, token, role, ip, userAgent, device, createdAt, expiresAt, lastActive, is2FAVerified }
+const pending2FATokens = new Map(); // tempToken -> { createdAt, expiresAt, ip, userAgent, device }
+const loginAuditHistory = []; // { id, timestamp, timeIST, role, ip, device, userAgent, status, details }
+
+function getClientIp(req) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+        return forwarded.split(',')[0].trim();
+    }
+    return req.socket?.remoteAddress || req.connection?.remoteAddress || '127.0.0.1';
+}
+
+function parseDevice(ua) {
+    if (!ua) return 'Unknown Device';
+    let browser = 'Browser';
+    let os = 'Device';
+    if (ua.includes('Edg/')) browser = 'Edge';
+    else if (ua.includes('Chrome') && !ua.includes('Edg/')) browser = 'Chrome';
+    else if (ua.includes('Firefox')) browser = 'Firefox';
+    else if (ua.includes('Safari') && !ua.includes('Chrome')) browser = 'Safari';
+
+    if (ua.includes('Windows')) os = 'Windows';
+    else if (ua.includes('Android')) os = 'Android';
+    else if (ua.includes('iPhone') || ua.includes('iPad')) os = 'iOS';
+    else if (ua.includes('Macintosh')) os = 'macOS';
+    else if (ua.includes('Linux')) os = 'Linux';
+
+    return `${browser} on ${os}`;
+}
+
+function formatIST(date = new Date()) {
+    try {
+        return new Intl.DateTimeFormat('en-IN', {
+            timeZone: 'Asia/Kolkata',
+            day: '2-digit',
+            month: 'short',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true
+        }).format(date) + ' IST';
+    } catch(e) {
+        return date.toISOString();
+    }
+}
+
+function recordLoginAudit(entry) {
+    loginAuditHistory.unshift({
+        id: 'aud-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6),
+        timestamp: Date.now(),
+        timeIST: formatIST(new Date()),
+        ...entry
+    });
+    if (loginAuditHistory.length > 50) {
+        loginAuditHistory.pop();
+    }
+}
 
 function verifyUserPassword(inputPassword, config) {
     if (!inputPassword) return null;
@@ -806,6 +862,7 @@ function isAuthorized(req, config, requireAdmin = false) {
         }
         // Sliding window: reset 30 minutes on active user interaction
         session.expiresAt = Date.now() + (30 * 60 * 1000);
+        session.lastActive = Date.now();
 
         if (requireAdmin && session.role !== 'ADMIN') {
             return false;
@@ -879,13 +936,38 @@ function startServer() {
                     const code = String(data.code || '').trim();
                     const secret = config.totp_secret || 'DELTA2FAINXAU777';
                     const isValid = verifyTotp(secret, code);
+                    const clientIp = getClientIp(req);
+                    const userAgent = req.headers['user-agent'] || '';
+                    const device = parseDevice(userAgent);
 
                     if (isValid) {
                         const tempToken = crypto.randomBytes(16).toString('hex');
-                        pending2FATokens.set(tempToken, { createdAt: Date.now(), expiresAt: Date.now() + (5 * 60 * 1000) });
+                        pending2FATokens.set(tempToken, {
+                            createdAt: Date.now(),
+                            expiresAt: Date.now() + (5 * 60 * 1000),
+                            ip: clientIp,
+                            userAgent,
+                            device
+                        });
+                        recordLoginAudit({
+                            role: 'PENDING_PASSWORD',
+                            ip: clientIp,
+                            device,
+                            userAgent,
+                            status: '2FA_PASSED',
+                            details: '2FA code verified successfully. Awaiting password.'
+                        });
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({ success: true, step: '2FA_VERIFIED', temp_token: tempToken }));
                     } else {
+                        recordLoginAudit({
+                            role: 'UNKNOWN',
+                            ip: clientIp,
+                            device,
+                            userAgent,
+                            status: 'FAILED_2FA',
+                            details: 'Incorrect 6-digit TOTP code entered.'
+                        });
                         res.writeHead(401, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({ success: false, error: 'INVALID_2FA_CODE', message: 'Invalid 6-digit 2FA code. Please check your Authenticator app.' }));
                     }
@@ -906,6 +988,9 @@ function startServer() {
                     const data = JSON.parse(body || '{}');
                     const tempToken = String(data.temp_token || '').trim();
                     const password = String(data.password || '').trim();
+                    const clientIp = getClientIp(req);
+                    const userAgent = req.headers['user-agent'] || '';
+                    const device = parseDevice(userAgent);
 
                     // Check temp token from Step 1 (2FA)
                     if (!pending2FATokens.has(tempToken) || Date.now() > pending2FATokens.get(tempToken).expiresAt) {
@@ -917,19 +1002,49 @@ function startServer() {
                     if (role) {
                         pending2FATokens.delete(tempToken);
                         const sessionToken = crypto.randomBytes(32).toString('hex');
+                        const sessionId = 'sess-' + sessionToken.slice(0, 8);
                         const expiresAt = Date.now() + (30 * 60 * 1000); // Strict 30-minute auto-logout
-                        activeSessions.set(sessionToken, { role: role, createdAt: Date.now(), expiresAt });
+                        activeSessions.set(sessionToken, {
+                            id: sessionId,
+                            token: sessionToken,
+                            role: role,
+                            ip: clientIp,
+                            userAgent,
+                            device,
+                            createdAt: Date.now(),
+                            expiresAt,
+                            lastActive: Date.now(),
+                            is2FAVerified: true
+                        });
+
+                        recordLoginAudit({
+                            role,
+                            ip: clientIp,
+                            device,
+                            userAgent,
+                            status: 'LOGIN_SUCCESS',
+                            details: `Full login successful as ${role} (2FA + Password).`
+                        });
 
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({
                             success: true,
                             token: sessionToken,
+                            session_id: sessionId,
                             role: role,
                             expires_at: expiresAt,
                             expires_in_seconds: 1800,
                             message: `Authenticated successfully as ${role}. Session valid for 30 minutes.`
                         }));
                     } else {
+                        recordLoginAudit({
+                            role: 'UNKNOWN',
+                            ip: clientIp,
+                            device,
+                            userAgent,
+                            status: 'FAILED_PASSWORD',
+                            details: 'Incorrect password entered after 2FA.'
+                        });
                         res.writeHead(401, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({ success: false, error: 'INCORRECT_PASSWORD', message: 'Incorrect Password.' }));
                     }
@@ -951,6 +1066,9 @@ function startServer() {
                     const inputPin = String(data.pin || data.password || '').trim();
                     const input2fa = String(data.code_2fa || data.code || '').trim();
                     const secret = config.totp_secret || 'DELTA2FAINXAU777';
+                    const clientIp = getClientIp(req);
+                    const userAgent = req.headers['user-agent'] || '';
+                    const device = parseDevice(userAgent);
 
                     let is2faOk = true;
                     if (input2fa) {
@@ -960,18 +1078,168 @@ function startServer() {
                     const role = verifyUserPassword(inputPin, config);
                     if (role && is2faOk) {
                         const sessionToken = crypto.randomBytes(32).toString('hex');
+                        const sessionId = 'sess-' + sessionToken.slice(0, 8);
                         const expiresAt = Date.now() + (30 * 60 * 1000);
-                        activeSessions.set(sessionToken, { role: role, createdAt: Date.now(), expiresAt });
+                        activeSessions.set(sessionToken, {
+                            id: sessionId,
+                            token: sessionToken,
+                            role: role,
+                            ip: clientIp,
+                            userAgent,
+                            device,
+                            createdAt: Date.now(),
+                            expiresAt,
+                            lastActive: Date.now(),
+                            is2FAVerified: true
+                        });
+
+                        recordLoginAudit({
+                            role,
+                            ip: clientIp,
+                            device,
+                            userAgent,
+                            status: 'LOGIN_SUCCESS',
+                            details: `Full login successful as ${role}.`
+                        });
 
                         res.writeHead(200, { 'Content-Type': 'application/json' });
-                        return res.end(JSON.stringify({ success: true, token: sessionToken, role: role, expires_at: expiresAt, expires_in_seconds: 1800 }));
+                        return res.end(JSON.stringify({ success: true, token: sessionToken, session_id: sessionId, role: role, expires_at: expiresAt, expires_in_seconds: 1800 }));
                     } else {
+                        recordLoginAudit({
+                            role: 'UNKNOWN',
+                            ip: clientIp,
+                            device,
+                            userAgent,
+                            status: !is2faOk ? 'FAILED_2FA' : 'FAILED_PASSWORD',
+                            details: !is2faOk ? 'Invalid 2FA code.' : 'Incorrect password.'
+                        });
                         res.writeHead(401, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({
                             success: false,
                             error: !is2faOk ? 'INVALID_2FA_CODE' : 'INCORRECT_PASSWORD',
                             message: !is2faOk ? 'Invalid 2FA code.' : 'Incorrect password.'
                         }));
+                    }
+                } catch(e) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: 'INVALID_JSON' }));
+                }
+            });
+            return;
+        }
+
+        // Active Sessions Monitor endpoint (Protected: Master Admin Only)
+        if (req.method === 'GET' && cleanPath === '/api/auth/active-sessions') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Master Admin privileges required to view active sessions.' }));
+            }
+
+            const now = Date.now();
+            const currentToken = req.headers['x-session-token'] || (req.headers['authorization'] || '').replace('Bearer ', '').trim();
+            const sessionList = [];
+            let adminCount = 0;
+            let viewerCount = 0;
+
+            for (const [tok, sess] of activeSessions.entries()) {
+                if (now > sess.expiresAt) {
+                    activeSessions.delete(tok);
+                    continue;
+                }
+                if (sess.role === 'ADMIN') adminCount++;
+                else if (sess.role === 'VIEWER') viewerCount++;
+
+                const minsLeft = Math.max(0, Math.round((sess.expiresAt - now) / 60000));
+                const activeAgoSec = Math.max(0, Math.round((now - (sess.lastActive || sess.createdAt)) / 1000));
+                let lastActiveLabel = 'Just now';
+                if (activeAgoSec >= 60) {
+                    lastActiveLabel = `${Math.floor(activeAgoSec / 60)}m ago`;
+                }
+
+                sessionList.push({
+                    id: sess.id,
+                    role: sess.role,
+                    ip: sess.ip,
+                    device: sess.device,
+                    login_time_ist: formatIST(new Date(sess.createdAt)),
+                    last_active: lastActiveLabel,
+                    expires_in_minutes: minsLeft,
+                    is_current: (tok === currentToken),
+                    is_2fa_verified: !!sess.is2FAVerified
+                });
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({
+                success: true,
+                total_active: sessionList.length,
+                admin_count: adminCount,
+                viewer_count: viewerCount,
+                sessions: sessionList,
+                audit_history: loginAuditHistory.slice(0, 15)
+            }));
+        }
+
+        // Force Logout / Terminate Session endpoint (Protected: Master Admin Only)
+        if (req.method === 'POST' && cleanPath === '/api/auth/terminate-session') {
+            if (!isAuthorized(req, config, true)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ error: 'FORBIDDEN', message: 'Master Admin privileges required.' }));
+            }
+
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', () => {
+                try {
+                    const data = JSON.parse(body || '{}');
+                    const targetId = String(data.session_id || '').trim();
+                    const currentToken = req.headers['x-session-token'] || (req.headers['authorization'] || '').replace('Bearer ', '').trim();
+
+                    if (targetId === 'ALL_OTHERS') {
+                        let kickedCount = 0;
+                        for (const [tok, sess] of activeSessions.entries()) {
+                            if (tok !== currentToken) {
+                                activeSessions.delete(tok);
+                                recordLoginAudit({
+                                    role: sess.role,
+                                    ip: sess.ip,
+                                    device: sess.device,
+                                    status: 'SESSION_TERMINATED',
+                                    details: `Session ${sess.id} terminated by Master Admin (Logout All Others).`
+                                });
+                                kickedCount++;
+                            }
+                        }
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: true, message: `Successfully logged out ${kickedCount} other session(s).` }));
+                    }
+
+                    let terminated = false;
+                    for (const [tok, sess] of activeSessions.entries()) {
+                        if (sess.id === targetId) {
+                            if (tok === currentToken) {
+                                res.writeHead(400, { 'Content-Type': 'application/json' });
+                                return res.end(JSON.stringify({ success: false, message: 'Cannot terminate your current active session. Use the Lock button to exit.' }));
+                            }
+                            activeSessions.delete(tok);
+                            recordLoginAudit({
+                                role: sess.role,
+                                ip: sess.ip,
+                                device: sess.device,
+                                status: 'SESSION_TERMINATED',
+                                details: `Session ${sess.id} terminated by Master Admin.`
+                            });
+                            terminated = true;
+                            break;
+                        }
+                    }
+
+                    if (terminated) {
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: true, message: `Session ${targetId} terminated successfully.` }));
+                    } else {
+                        res.writeHead(404, { 'Content-Type': 'application/json' });
+                        return res.end(JSON.stringify({ success: false, message: 'Session not found or already expired.' }));
                     }
                 } catch(e) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1432,12 +1700,40 @@ function startServer() {
 
     <!-- Security & Password Management Modal -->
     <div id="security-modal" style="display: none; position: fixed; inset: 0; background: rgba(8, 11, 18, 0.94); backdrop-filter: blur(8px); align-items: center; justify-content: center; z-index: 10000;">
-        <div class="auth-card" style="width: 450px; max-height: 90vh; overflow-y: auto; text-align: left;">
+        <div class="auth-card" style="width: 530px; max-width: 95vw; max-height: 90vh; overflow-y: auto; text-align: left;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--border-subtle); padding-bottom: 10px;">
                 <h3 style="font-size: 16px; font-weight: 700; color: white; display: flex; align-items: center; gap: 8px;">
                     <span>⚙️ Security & Password Settings</span>
                 </h3>
                 <button onclick="closeSecurityModal()" style="background: none; border: none; color: var(--text-dim); font-size: 18px; cursor: pointer;">✕</button>
+            </div>
+
+            <!-- Active 2FA Logins & Connected Devices -->
+            <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 14px; font-size: 12px; margin-bottom: 20px;">
+                <div style="font-weight: 600; color: #38bdf8; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
+                    <span style="display: flex; align-items: center; gap: 6px;">👥 Active Logins & Connected Devices</span>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <span id="active-sessions-badge" style="font-size: 10px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); padding: 2px 6px; border-radius: 4px;">1 Online</span>
+                        <button onclick="logoutAllOtherSessions()" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; padding: 2px 6px; border-radius: 4px; font-size: 10px; cursor: pointer;" title="Kick all other logged in sessions except this device">🚪 Logout Others</button>
+                    </div>
+                </div>
+                <p style="color: var(--text-dim); margin-bottom: 10px; font-size: 11px;">
+                    Real-time monitor of users logged in with 2FA & Password. Master Admin can terminate any active session.
+                </p>
+                <div id="active-sessions-list" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+                    <div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 10px;">⏳ Loading active sessions...</div>
+                </div>
+
+                <!-- Recent 2FA Login Audit Trail -->
+                <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 10px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;" onclick="toggleAuditLog()">
+                        <span style="font-size: 11px; color: var(--text-muted); font-weight: 600;">📜 Recent 2FA Login History</span>
+                        <span id="audit-toggle-arrow" style="font-size: 10px; color: var(--text-dim);">▼ Show</span>
+                    </div>
+                    <div id="audit-log-container" style="display: none; margin-top: 8px; max-height: 140px; overflow-y: auto; background: #080b12; border-radius: 4px; padding: 6px 8px; font-family: monospace; font-size: 10px; color: var(--text-dim);">
+                        Loading audit log...
+                    </div>
+                </div>
             </div>
 
             <!-- Change Master Password Form -->
@@ -1557,6 +1853,10 @@ function startServer() {
                 <div class="pill-stat" id="pill-session" style="border-color: rgba(56, 189, 248, 0.35);">
                     <span>Session: </span>
                     <strong id="session-countdown" style="color: #38bdf8;">30:00</strong>
+                </div>
+                <div class="pill-stat" id="pill-active-users" onclick="openSecurityModal()" style="border-color: rgba(56, 189, 248, 0.35); cursor: pointer;" title="Click to view Active 2FA Logins & Connected Devices">
+                    <span>Online: </span>
+                    <strong id="header-active-users" style="color: #34d399;">1 Active</strong>
                 </div>
                 <button class="btn btn-secondary" id="btn-security-settings" onclick="openSecurityModal()" style="padding: 6px 12px; font-size: 12px;" title="View or change login password & 2FA settings">⚙️ Security</button>
                 <button class="btn btn-secondary" id="btn-lock" onclick="logout('Locked by owner.')" style="padding: 6px 12px; font-size: 12px;">🔒 Lock</button>
@@ -2064,6 +2364,146 @@ function startServer() {
             }
         }
 
+        let activeSessionsInterval = null;
+
+        async function fetchActiveSessions() {
+            try {
+                const res = await fetch('/api/auth/active-sessions', {
+                    headers: authHeaders()
+                });
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!data.success) return;
+
+                const headerEl = document.getElementById('header-active-users');
+                if (headerEl) headerEl.textContent = data.total_active + ' Active';
+
+                const badgeEl = document.getElementById('active-sessions-badge');
+                if (badgeEl) badgeEl.textContent = data.total_active + ' Online (' + data.admin_count + ' Admin, ' + data.viewer_count + ' Viewer)';
+
+                const listEl = document.getElementById('active-sessions-list');
+                if (!listEl) return;
+
+                if (!data.sessions || data.sessions.length === 0) {
+                    listEl.innerHTML = '<div style="color: var(--text-muted); font-size: 11px; text-align: center; padding: 10px;">No active sessions found.</div>';
+                    return;
+                }
+
+                let html = '';
+                data.sessions.forEach(s => {
+                    const isCurrent = s.is_current;
+                    const roleColor = s.role === 'ADMIN' ? '#38bdf8' : '#34d399';
+                    const roleLabel = s.role === 'ADMIN' ? '🛡️ Master Admin' : '👁️ Viewer';
+
+                    html += '<div style="background: #080b12; border: 1px solid ' + (isCurrent ? 'rgba(56, 189, 248, 0.4)' : 'var(--border-subtle)') + '; border-radius: 6px; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px;">' +
+                        '<div style="flex: 1; min-width: 0;">' +
+                            '<div style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; flex-wrap: wrap;">' +
+                                '<span style="display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #34d399; box-shadow: 0 0 6px #34d399;"></span>' +
+                                '<strong style="color: ' + roleColor + '; font-size: 12px;">' + roleLabel + '</strong>' +
+                                (isCurrent ? '<span style="font-size: 9px; background: rgba(56, 189, 248, 0.2); color: #38bdf8; padding: 1px 5px; border-radius: 3px; font-weight: 600;">THIS DEVICE</span>' : '') +
+                                '<span style="font-size: 9px; background: rgba(52, 211, 153, 0.15); color: #34d399; padding: 1px 5px; border-radius: 3px;">2FA Verified</span>' +
+                            '</div>' +
+                            '<div style="font-size: 11px; color: var(--text-dim); display: flex; flex-wrap: wrap; gap: 8px;">' +
+                                '<span>💻 <strong>' + s.device + '</strong></span>' +
+                                '<span>🌐 <code>' + s.ip + '</code></span>' +
+                            '</div>' +
+                            '<div style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">' +
+                                'Login: ' + s.login_time_ist + ' • Active: <span style="color: #38bdf8;">' + s.last_active + '</span> • Auto-lock: ' + s.expires_in_minutes + 'm left' +
+                            '</div>' +
+                        '</div>' +
+                        (!isCurrent ? '<button onclick="terminateSession(\'' + s.id + '\')" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #f87171; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; white-space: nowrap;" title="Forcibly logout this session">🚪 Logout</button>' : '') +
+                    '</div>';
+                });
+                listEl.innerHTML = html;
+
+                // Render Audit Trail
+                const auditEl = document.getElementById('audit-log-container');
+                if (auditEl && data.audit_history) {
+                    if (data.audit_history.length === 0) {
+                        auditEl.innerHTML = '<span style="color: var(--text-muted);">No login events logged yet.</span>';
+                    } else {
+                        let auditHtml = '';
+                        data.audit_history.forEach(a => {
+                            let statusColor = '#34d399';
+                            let icon = '✅';
+                            if (a.status && a.status.includes('FAILED')) {
+                                statusColor = '#f87171';
+                                icon = '❌';
+                            } else if (a.status === 'SESSION_TERMINATED') {
+                                statusColor = '#f59e0b';
+                                icon = '🚪';
+                            }
+                            auditHtml += '<div style="margin-bottom: 4px; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.04);">' +
+                                '<div style="display: flex; justify-content: space-between;">' +
+                                    '<span>' + icon + ' <strong style="color: ' + statusColor + ';">' + a.status + '</strong> (' + a.role + ')</span>' +
+                                    '<span style="color: var(--text-muted);">' + a.timeIST + '</span>' +
+                                '</div>' +
+                                '<div style="color: var(--text-dim); margin-top: 1px;">' +
+                                    '<code>' + a.ip + '</code> • ' + a.device + ' • ' + a.details +
+                                '</div>' +
+                            '</div>';
+                        });
+                        auditEl.innerHTML = auditHtml;
+                    }
+                }
+            } catch(e) {
+                console.error('Error fetching active sessions:', e);
+            }
+        }
+
+        async function terminateSession(sessionId) {
+            if (!confirm('Are you sure you want to forcibly logout this session? The user on that device will be locked out immediately.')) return;
+            try {
+                const res = await fetch('/api/auth/terminate-session', {
+                    method: 'POST',
+                    headers: authHeaders(),
+                    body: JSON.stringify({ session_id: sessionId })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert('Session successfully terminated. Device logged out.');
+                    fetchActiveSessions();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            } catch(e) {
+                alert('Network error: ' + e.message);
+            }
+        }
+
+        async function logoutAllOtherSessions() {
+            if (!confirm('Are you sure you want to logout all other active sessions? Only this current browser will remain logged in.')) return;
+            try {
+                const res = await fetch('/api/auth/terminate-session', {
+                    method: 'POST',
+                    headers: authHeaders(),
+                    body: JSON.stringify({ session_id: 'ALL_OTHERS' })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert(data.message);
+                    fetchActiveSessions();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            } catch(e) {
+                alert('Network error: ' + e.message);
+            }
+        }
+
+        function toggleAuditLog() {
+            const el = document.getElementById('audit-log-container');
+            const arrow = document.getElementById('audit-toggle-arrow');
+            if (!el) return;
+            if (el.style.display === 'none') {
+                el.style.display = 'block';
+                if (arrow) arrow.textContent = '▲ Hide';
+            } else {
+                el.style.display = 'none';
+                if (arrow) arrow.textContent = '▼ Show';
+            }
+        }
+
         // Security Settings Modal
         function openSecurityModal() {
             document.getElementById('security-modal').style.display = 'flex';
@@ -2082,6 +2522,10 @@ function startServer() {
             fetchWhatsAppStatus();
             if (waStatusInterval) clearInterval(waStatusInterval);
             waStatusInterval = setInterval(fetchWhatsAppStatus, 3000);
+
+            fetchActiveSessions();
+            if (activeSessionsInterval) clearInterval(activeSessionsInterval);
+            activeSessionsInterval = setInterval(fetchActiveSessions, 3000);
         }
 
         function closeSecurityModal() {
@@ -2089,6 +2533,10 @@ function startServer() {
             if (waStatusInterval) {
                 clearInterval(waStatusInterval);
                 waStatusInterval = null;
+            }
+            if (activeSessionsInterval) {
+                clearInterval(activeSessionsInterval);
+                activeSessionsInterval = null;
             }
         }
 
@@ -2440,10 +2888,12 @@ function startServer() {
                 fetchLiveBalance();
                 fetchScannerStatus();
                 refreshPositionsAndOrders();
+                fetchActiveSessions();
 
                 dashboardIntervals.push(setInterval(fetchScannerStatus, 4000));
                 dashboardIntervals.push(setInterval(fetchLiveBalance, 15000));
                 dashboardIntervals.push(setInterval(refreshPositionsAndOrders, 10000));
+                dashboardIntervals.push(setInterval(fetchActiveSessions, 10000));
             } else {
                 dashboardIntervals.push(setInterval(() => loadMarketAnalysis(currentSymbol), 10000));
             }
