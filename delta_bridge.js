@@ -1664,13 +1664,15 @@ function startServer() {
                     </p>
                 </div>
 
-                <div style="margin: 16px 0;">
-                    <label style="font-size: 11px; text-transform: uppercase; color: var(--text-dim); font-weight: 600;">6-Digit Authenticator Code</label>
-                    <input type="text" id="input-2fa-code" maxlength="6" class="auth-input" placeholder="000000" style="font-size: 24px; letter-spacing: 6px; margin: 8px 0; text-align: center;" onkeydown="if(event.key==='Enter') submit2FA()">
-                    <div id="2fa-error" style="color: var(--red); font-size: 12px; margin-bottom: 8px; display: none;">Invalid 2FA code. Please check your app.</div>
-                </div>
+                <form id="form-2fa" onsubmit="event.preventDefault(); submit2FA();" autocomplete="off">
+                    <div style="margin: 16px 0;">
+                        <label style="font-size: 11px; text-transform: uppercase; color: var(--text-dim); font-weight: 600;">6-Digit Authenticator Code</label>
+                        <input type="text" inputmode="numeric" pattern="[0-9]*" id="input-2fa-code" maxlength="6" class="auth-input" placeholder="000000" style="font-size: 24px; letter-spacing: 6px; margin: 8px 0; text-align: center;" autocomplete="one-time-code" oninput="handle2FAInput(this)" onkeydown="handle2FAKeyDown(event)">
+                        <div id="2fa-error" style="color: var(--red); font-size: 12px; margin-bottom: 8px; display: none;">Invalid 2FA code. Please check your app.</div>
+                    </div>
 
-                <button class="btn-unlock" onclick="submit2FA()" id="btn-verify-2fa">Verify 2FA Code ➔</button>
+                    <button type="submit" class="btn-unlock" id="btn-verify-2fa">Verify 2FA Code ➔</button>
+                </form>
             </div>
 
             <!-- Step 2: Master Password Entry -->
@@ -1686,14 +1688,16 @@ function startServer() {
                     </p>
                 </div>
 
-                <div style="margin: 16px 0;">
-                    <label style="font-size: 11px; text-transform: uppercase; color: var(--text-dim); font-weight: 600;">Master Password</label>
-                    <input type="password" id="input-password" class="auth-input" placeholder="Enter Password" style="margin: 8px 0; text-align: center; letter-spacing: 2px;" onkeydown="if(event.key==='Enter') submitPassword()">
-                    <div id="password-error" style="color: var(--red); font-size: 12px; margin-bottom: 8px; display: none;">Incorrect Master Password</div>
-                </div>
+                <form id="form-password" onsubmit="event.preventDefault(); submitPassword();" autocomplete="off">
+                    <div style="margin: 16px 0;">
+                        <label style="font-size: 11px; text-transform: uppercase; color: var(--text-dim); font-weight: 600;">Master Password</label>
+                        <input type="password" id="input-password" class="auth-input" placeholder="Enter Password" style="margin: 8px 0; text-align: center; letter-spacing: 2px;" onkeydown="if(event.key==='Enter' || event.keyCode===13) { event.preventDefault(); submitPassword(); }">
+                        <div id="password-error" style="color: var(--red); font-size: 12px; margin-bottom: 8px; display: none;">Incorrect Master Password</div>
+                    </div>
 
-                <button class="btn-unlock" onclick="submitPassword()" id="btn-unlock-terminal" style="background: #059669; margin-bottom: 10px;">Unlock Institutional Terminal 🔓</button>
-                <button class="btn btn-secondary" onclick="backTo2FA()" style="width: 100%; font-size: 12px;">⬅ Back to 2FA Step</button>
+                    <button type="submit" class="btn-unlock" id="btn-unlock-terminal" style="background: #059669; margin-bottom: 10px;">Unlock Institutional Terminal 🔓</button>
+                    <button type="button" class="btn btn-secondary" onclick="backTo2FA()" style="width: 100%; font-size: 12px;">⬅ Back to 2FA Step</button>
+                </form>
             </div>
         </div>
     </div>
@@ -2155,21 +2159,46 @@ function startServer() {
             showAuthStep1();
         }
 
+        let isVerifying2FA = false;
+
+        function handle2FAKeyDown(event) {
+            if (event.key === 'Enter' || event.keyCode === 13 || event.which === 13) {
+                event.preventDefault();
+                submit2FA();
+            }
+        }
+
+        function handle2FAInput(inputEl) {
+            if (!inputEl) return;
+            const clean = inputEl.value.replace(/[^0-9]/g, '');
+            inputEl.value = clean;
+            if (clean.length === 6 && !isVerifying2FA) {
+                submit2FA();
+            }
+        }
+
         // Submit Step 1: 2FA Code
         async function submit2FA() {
-            const code = document.getElementById('input-2fa-code').value.trim();
+            if (isVerifying2FA) return;
+            const inputEl = document.getElementById('input-2fa-code');
+            const code = inputEl ? inputEl.value.replace(/[^0-9]/g, '').trim() : '';
             const errEl = document.getElementById('2fa-error');
             const btn = document.getElementById('btn-verify-2fa');
 
             if (!code || code.length < 6) {
-                errEl.style.display = 'block';
-                errEl.textContent = 'Please enter a valid 6-digit 2FA code.';
+                if (errEl) {
+                    errEl.style.display = 'block';
+                    errEl.textContent = 'Please enter a valid 6-digit 2FA code.';
+                }
                 return;
             }
 
-            btn.disabled = true;
-            btn.textContent = 'Verifying 2FA...';
-            errEl.style.display = 'none';
+            isVerifying2FA = true;
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Verifying 2FA...';
+            }
+            if (errEl) errEl.style.display = 'none';
 
             try {
                 const res = await fetch('/api/auth/verify-2fa', {
@@ -2182,15 +2211,23 @@ function startServer() {
                     pendingTempToken = data.temp_token;
                     showAuthStep2();
                 } else {
-                    errEl.style.display = 'block';
-                    errEl.textContent = data.message || 'Invalid 2FA code. Please check your Authenticator app.';
+                    if (errEl) {
+                        errEl.style.display = 'block';
+                        errEl.textContent = data.message || 'Invalid 2FA code. Please check your Authenticator app.';
+                    }
+                    if (inputEl) inputEl.select();
                 }
             } catch(e) {
-                errEl.style.display = 'block';
-                errEl.textContent = 'Connection error verifying 2FA: ' + e.message;
+                if (errEl) {
+                    errEl.style.display = 'block';
+                    errEl.textContent = 'Connection error verifying 2FA: ' + e.message;
+                }
             } finally {
-                btn.disabled = false;
-                btn.textContent = 'Verify 2FA Code ➔';
+                isVerifying2FA = false;
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = 'Verify 2FA Code ➔';
+                }
             }
         }
 
