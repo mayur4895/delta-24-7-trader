@@ -1,8 +1,8 @@
 """
 Delta Exchange Signal Filter & Execution Strategist Module
 Strict constraints:
-1. Max 3 trades per calendar day (UTC 00:00 - 23:59:59).
-2. Mandatory Stop-Loss and fixed 1:2 or 1:3 Risk-to-Reward Ratio (RRR).
+1. Unlimited trades per calendar day.
+2. Mandatory Stop-Loss and minimum 1:2 RRR (no upper restriction, default 1:3).
 3. Delta Exchange Bracket Order and Webhook JSON formatting.
 """
 
@@ -74,30 +74,34 @@ def calculate_bracket_targets(
     side: str,
     entry_price: float,
     stop_loss: float,
-    rrr_multiplier: int = DEFAULT_RRR
+    rrr_multiplier: float = DEFAULT_RRR
 ) -> Tuple[float, float, float]:
     """
-    Calculates 1R Risk distance and Take-Profit according to strict 1:2 or 1:3 RRR.
+    Calculates 1R Risk distance and Take-Profit according to minimum 1:2 RRR (no upper restriction).
     Returns: (risk_distance, take_profit, calculated_rrr)
     """
     side = side.upper()
-    if rrr_multiplier not in (2, 3):
-        rrr_multiplier = DEFAULT_RRR
+    try:
+        rrr_float = float(rrr_multiplier)
+        if rrr_float < 2.0:
+            rrr_float = float(DEFAULT_RRR)
+    except (ValueError, TypeError):
+        rrr_float = float(DEFAULT_RRR)
 
     if side in ("BUY", "LONG"):
         if stop_loss >= entry_price:
             raise ValueError(f"For LONG/BUY, Stop Loss ({stop_loss}) must be BELOW Entry Price ({entry_price}).")
         risk_distance = round(entry_price - stop_loss, 4)
-        take_profit = round(entry_price + (risk_distance * rrr_multiplier), 4)
+        take_profit = round(entry_price + (risk_distance * rrr_float), 4)
     elif side in ("SELL", "SHORT"):
         if stop_loss <= entry_price:
             raise ValueError(f"For SHORT/SELL, Stop Loss ({stop_loss}) must be ABOVE Entry Price ({entry_price}).")
         risk_distance = round(stop_loss - entry_price, 4)
-        take_profit = round(entry_price - (risk_distance * rrr_multiplier), 4)
+        take_profit = round(entry_price - (risk_distance * rrr_float), 4)
     else:
         raise ValueError(f"Invalid side '{side}'. Must be BUY/LONG or SELL/SHORT.")
 
-    return risk_distance, take_profit, float(rrr_multiplier)
+    return risk_distance, take_profit, rrr_float
 
 
 def generate_delta_exchange_payload(
@@ -174,7 +178,7 @@ def process_signal(
             "timestamp_utc": utc_now
         }
 
-    # If TP was passed in signal, verify it satisfies at least 1:2 or 1:3
+    # If TP was passed in signal, verify it satisfies at least 1:2 (no upper restriction)
     final_tp = calculated_tp
     if take_profit is not None and take_profit > 0:
         actual_reward = abs(take_profit - entry_price)
@@ -182,7 +186,7 @@ def process_signal(
         if actual_rrr < 2.0:
             return {
                 "status": "REJECTED",
-                "reason": f"RRR_TOO_LOW: Provided TP yields {actual_rrr}:1, minimum required is 1:2 (default 1:3).",
+                "reason": f"RRR_TOO_LOW: Provided TP yields {actual_rrr}:1, minimum required is 1:2 (no upper restriction).",
                 "timestamp_utc": utc_now
             }
         final_tp = take_profit

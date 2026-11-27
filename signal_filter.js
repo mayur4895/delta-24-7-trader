@@ -2,8 +2,8 @@
  * Delta Exchange Signal Filter & Execution Strategist (Node.js)
  * 
  * Strict constraints:
- * 1. DAILY TRADE LIMIT: Max 3 trades per calendar day (UTC 00:00 - 23:59:59).
- * 2. RISK-TO-REWARD RATIO: Fixed 1:2 or 1:3 (default 1:3). Mandatory Stop-Loss.
+ * 1. DAILY TRADE LIMIT: Unlimited trades per calendar day.
+ * 2. RISK-TO-REWARD RATIO: Minimum 1:2 RRR (default 1:3). No upper restriction (e.g. 1:2, 1:2.5, 1:3, 1:4+). Mandatory Stop-Loss.
  * 3. DELTA EXCHANGE COMPATIBILITY: Output clean bracket order webhook & REST payloads.
  */
 
@@ -59,8 +59,12 @@ function checkDailyLimit() {
 
 function calculateBracketTargets(side, entryPrice, stopLoss, rrrMultiplier = DEFAULT_RRR) {
     const sideNorm = side.toUpperCase();
-    if (rrrMultiplier !== 2 && rrrMultiplier !== 3) {
+    const parsedRrr = parseFloat(rrrMultiplier);
+    // Minimum 1:2 RRR enforced. No upper restriction (allows 1:2, 1:2.5, 1:3, 1:4, 1:5, etc.)
+    if (isNaN(parsedRrr) || parsedRrr < 2.0) {
         rrrMultiplier = DEFAULT_RRR;
+    } else {
+        rrrMultiplier = parsedRrr;
     }
 
     let riskDist = 0;
@@ -148,14 +152,14 @@ function processSignal({
     let finalTp = bracket.takeProfit;
     let finalRrr = bracket.rrr;
 
-    // If signal provided its own TP, verify it satisfies at least 1:2
+    // If signal provided its own TP, verify it satisfies at least 1:2 (no upper restriction)
     if (takeProfit != null && takeProfit > 0) {
         const rewardDist = Math.abs(takeProfit - entryPrice);
         const actualRrr = parseFloat((rewardDist / bracket.riskDist).toFixed(2));
         if (actualRrr < 2.0) {
             return {
                 status: 'REJECTED',
-                reason: `RRR_TOO_LOW: Provided TP yields 1:${actualRrr}, but minimum permitted is 1:2 (default 1:3).`,
+                reason: `RRR_TOO_LOW: Provided TP yields 1:${actualRrr}, but minimum permitted is 1:2 (no upper restriction).`,
                 timestamp_utc: utcNow
             };
         }
