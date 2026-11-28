@@ -2,8 +2,9 @@
 Delta Exchange Signal Filter & Execution Strategist Module
 Strict constraints:
 1. Unlimited trades per calendar day.
-2. Mandatory Stop-Loss and minimum 1:2 RRR (no upper restriction, default 1:3).
-3. Delta Exchange Bracket Order and Webhook JSON formatting.
+2. Mandatory Stop-Loss and strict 1:2 to 1:4 RRR (default 1:3).
+3. Max 2.0% SL risk distance to prevent oversized trades.
+4. Delta Exchange Bracket Order and Webhook JSON formatting.
 """
 
 import json
@@ -13,7 +14,10 @@ from typing import Dict, Any, Tuple, Optional
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "daily_trades.json")
 MAX_DAILY_TRADES = float("inf")  # Unlimited trades per day
-DEFAULT_RRR = 3  # 1:3 default
+MIN_RRR = 2.0  # 1:2
+MAX_RRR = 4.0  # 1:4
+DEFAULT_RRR = 3.0  # 1:3 default
+MAX_RISK_PERCENT = 2.0  # 2.0% max SL distance
 
 
 def get_current_utc_date() -> str:
@@ -77,13 +81,13 @@ def calculate_bracket_targets(
     rrr_multiplier: float = DEFAULT_RRR
 ) -> Tuple[float, float, float]:
     """
-    Calculates 1R Risk distance and Take-Profit according to minimum 1:2 RRR (no upper restriction).
+    Calculates 1R Risk distance and Take-Profit strictly between 1:2 and 1:4 RRR (default 1:3).
     Returns: (risk_distance, take_profit, calculated_rrr)
     """
     side = side.upper()
     try:
         rrr_float = float(rrr_multiplier)
-        if rrr_float < 2.0:
+        if rrr_float < MIN_RRR or rrr_float > MAX_RRR:
             rrr_float = float(DEFAULT_RRR)
     except (ValueError, TypeError):
         rrr_float = float(DEFAULT_RRR)
@@ -178,15 +182,24 @@ def process_signal(
             "timestamp_utc": utc_now
         }
 
-    # If TP was passed in signal, verify it satisfies at least 1:2 (no upper restriction)
+    # Rule 2: Risk Distance Guard (Prevent oversized SL and massive trades)
+    risk_percent = (risk_dist / entry_price) * 100
+    if risk_percent > MAX_RISK_PERCENT:
+        return {
+            "status": "REJECTED",
+            "reason": f"EXCESSIVE_RISK_DISTANCE: Stop-Loss distance is {risk_percent:.2f}%, exceeding maximum {MAX_RISK_PERCENT}% limit to keep risk tight.",
+            "timestamp_utc": utc_now
+        }
+
+    # If TP was passed in signal, verify it satisfies 1:2 to 1:4 strict bounds
     final_tp = calculated_tp
     if take_profit is not None and take_profit > 0:
         actual_reward = abs(take_profit - entry_price)
         actual_rrr = round(actual_reward / risk_dist, 2)
-        if actual_rrr < 2.0:
+        if actual_rrr < MIN_RRR or actual_rrr > MAX_RRR:
             return {
                 "status": "REJECTED",
-                "reason": f"RRR_TOO_LOW: Provided TP yields {actual_rrr}:1, minimum required is 1:2 (no upper restriction).",
+                "reason": f"RRR_OUT_OF_BOUNDS: Provided TP yields 1:{actual_rrr}, but RRR must be strictly between 1:2 and 1:4 (target 1:3).",
                 "timestamp_utc": utc_now
             }
         final_tp = take_profit

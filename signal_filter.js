@@ -3,8 +3,9 @@
  * 
  * Strict constraints:
  * 1. DAILY TRADE LIMIT: Unlimited trades per calendar day.
- * 2. RISK-TO-REWARD RATIO: Minimum 1:2 RRR (default 1:3). No upper restriction (e.g. 1:2, 1:2.5, 1:3, 1:4+). Mandatory Stop-Loss.
- * 3. DELTA EXCHANGE COMPATIBILITY: Output clean bracket order webhook & REST payloads.
+ * 2. RISK-TO-REWARD RATIO: Strictly bounded between 1:2 (min) and 1:4 (max), default 1:3.
+ * 3. MAXIMUM SL DISTANCE: Maximum 2.0% price distance from entry to SL (prevents oversized trades).
+ * 4. DELTA EXCHANGE COMPATIBILITY: Output clean bracket order webhook & REST payloads.
  */
 
 const fs = require('fs');
@@ -12,7 +13,10 @@ const path = require('path');
 
 const STATE_FILE = path.join(__dirname, 'daily_trades.json');
 const MAX_DAILY_TRADES = Infinity; // Unlimited trades per day
-const DEFAULT_RRR = 3; // 1:3
+const MIN_RRR = 2.0; // 1:2
+const MAX_RRR = 4.0; // 1:4
+const DEFAULT_RRR = 3.0; // 1:3
+const MAX_RISK_PERCENT = 2.0; // 2.0% max SL distance to keep risk tight
 
 function getCurrentUtcDate() {
     return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
@@ -60,8 +64,8 @@ function checkDailyLimit() {
 function calculateBracketTargets(side, entryPrice, stopLoss, rrrMultiplier = DEFAULT_RRR) {
     const sideNorm = side.toUpperCase();
     const parsedRrr = parseFloat(rrrMultiplier);
-    // Minimum 1:2 RRR enforced. No upper restriction (allows 1:2, 1:2.5, 1:3, 1:4, 1:5, etc.)
-    if (isNaN(parsedRrr) || parsedRrr < 2.0) {
+    // Strict RRR bounds: Minimum 1:2, Maximum 1:4 (Default 1:3)
+    if (isNaN(parsedRrr) || parsedRrr < MIN_RRR || parsedRrr > MAX_RRR) {
         rrrMultiplier = DEFAULT_RRR;
     } else {
         rrrMultiplier = parsedRrr;
@@ -149,17 +153,27 @@ function processSignal({
         };
     }
 
+    // 2. Risk Distance Guard (Prevent oversized SL and massive trades)
+    const riskPercent = (bracket.riskDist / entryPrice) * 100;
+    if (riskPercent > MAX_RISK_PERCENT) {
+        return {
+            status: 'REJECTED',
+            reason: `EXCESSIVE_RISK_DISTANCE: Stop-Loss distance is ${riskPercent.toFixed(2)}%, exceeding maximum ${MAX_RISK_PERCENT}% limit to keep risk tight.`,
+            timestamp_utc: utcNow
+        };
+    }
+
     let finalTp = bracket.takeProfit;
     let finalRrr = bracket.rrr;
 
-    // If signal provided its own TP, verify it satisfies at least 1:2 (no upper restriction)
+    // If signal provided its own TP, verify it satisfies 1:2 to 1:4 strict bounds
     if (takeProfit != null && takeProfit > 0) {
         const rewardDist = Math.abs(takeProfit - entryPrice);
         const actualRrr = parseFloat((rewardDist / bracket.riskDist).toFixed(2));
-        if (actualRrr < 2.0) {
+        if (actualRrr < MIN_RRR || actualRrr > MAX_RRR) {
             return {
                 status: 'REJECTED',
-                reason: `RRR_TOO_LOW: Provided TP yields 1:${actualRrr}, but minimum permitted is 1:2 (no upper restriction).`,
+                reason: `RRR_OUT_OF_BOUNDS: Provided TP yields 1:${actualRrr}, but RRR must be strictly between 1:2 and 1:4 (target 1:3).`,
                 timestamp_utc: utcNow
             };
         }
@@ -219,7 +233,10 @@ module.exports = {
     loadTradeState,
     saveTradeState,
     MAX_DAILY_TRADES,
-    DEFAULT_RRR
+    MIN_RRR,
+    MAX_RRR,
+    DEFAULT_RRR,
+    MAX_RISK_PERCENT
 };
 
 // Self-test if run directly

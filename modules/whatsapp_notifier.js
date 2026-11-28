@@ -6,7 +6,12 @@
  * - 8855964895 (918855964895@s.whatsapp.net)
  * - 9022713613 (919022713613@s.whatsapp.net)
  * 
- * Zero third-party fees. Zero bot capacity issues. 100% automated.
+ * Includes:
+ * 1. Resilient Outbound Message Queue (Never drops messages during socket reconnects)
+ * 2. Stage 1 Alert: Setup Formed (Fresh Supply/Demand Zone)
+ * 3. Stage 2 Alert: Approaching Zone (~1-2 min warning before entry)
+ * 4. Stage 3 Alert: Setup Retest Confirmed & Order Executed
+ * 5. Strict 1:2 to 1:4 RRR Policy and Tight Risk Guard
  */
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -28,16 +33,100 @@ let isConnected = false;
 let connectedUser = null;
 let connectionStatusText = 'Initializing WhatsApp engine...';
 const alertHistory = [];
-const sentSetupSignatures = new Map(); // signature -> timestamp
+const sentSignatures = new Map(); // signature_stage -> timestamp
+const outboundQueue = []; // In-memory queue for alerts during socket handshake/reconnect
+let isFlushingQueue = false;
 
 /**
- * Format pre-trade reminder when a setup is forming
+ * Flush any queued outbound alerts through active socket
+ */
+async function flushOutboundQueue() {
+    if (!isConnected || !waSocket || isFlushingQueue || outboundQueue.length === 0) return;
+    isFlushingQueue = true;
+    console.log(`[WhatsApp Queue] 🚀 Flushing ${outboundQueue.length} queued alert(s) to WhatsApp...`);
+
+    while (outboundQueue.length > 0 && isConnected && waSocket) {
+        const item = outboundQueue.shift();
+        try {
+            await waSocket.sendMessage(item.jid, { text: item.text });
+            console.log(`[WhatsApp Queue] ✅ Flushed queued alert to ${item.phone}`);
+            // Brief pause (300ms) between messages to respect rate limits
+            await new Promise(r => setTimeout(r, 300));
+        } catch (err) {
+            console.error(`[WhatsApp Queue] ❌ Error delivering queued message to ${item.phone}:`, err.message);
+            if (!isConnected) {
+                // Return to queue if connection dropped
+                outboundQueue.unshift(item);
+                break;
+            }
+        }
+    }
+    isFlushingQueue = false;
+}
+
+// Check and flush queue periodically if connected
+setInterval(() => {
+    if (isConnected && waSocket && outboundQueue.length > 0) {
+        flushOutboundQueue().catch(() => {});
+    }
+}, 5000);
+
+/**
+ * Send alert immediately or enqueue if socket is still establishing
+ */
+async function sendOrQueueMessage(recipient, text, alertType = 'ALERT') {
+    const jid = `${recipient.clean}@s.whatsapp.net`;
+    const waLink = `https://api.whatsapp.com/send?phone=${recipient.clean}&text=${encodeURIComponent(text)}`;
+
+    if (isConnected && waSocket) {
+        try {
+            await waSocket.sendMessage(jid, { text });
+            console.log(`[WhatsApp Notifier] ✅ Delivered ${alertType} to ${recipient.phone}`);
+            return {
+                phone: recipient.phone,
+                clean: recipient.clean,
+                name: recipient.name,
+                success: true,
+                queued: false,
+                status: `✅ Delivered to ${recipient.name} (${recipient.phone}) via Linked Device`,
+                wa_link: waLink
+            };
+        } catch (err) {
+            console.warn(`[WhatsApp Notifier] ⚠️ Immediate send failed to ${recipient.phone} (${err.message}). Queueing for auto-flush...`);
+            outboundQueue.push({ jid, phone: recipient.phone, text, timestamp: Date.now() });
+            return {
+                phone: recipient.phone,
+                clean: recipient.clean,
+                name: recipient.name,
+                success: true,
+                queued: true,
+                status: `⏳ Queued for auto-delivery upon connection`,
+                wa_link: waLink
+            };
+        }
+    } else {
+        console.log(`[WhatsApp Notifier] ⏳ Socket not ready. Queued ${alertType} for ${recipient.phone} (Will deliver automatically once connected)`);
+        outboundQueue.push({ jid, phone: recipient.phone, text, timestamp: Date.now() });
+        return {
+            phone: recipient.phone,
+            clean: recipient.clean,
+            name: recipient.name,
+            success: true,
+            queued: true,
+            status: `⏳ Queued for auto-delivery upon connection`,
+            wa_link: waLink
+        };
+    }
+}
+
+/**
+ * Format Stage 1: Setup Formed (Fresh Zone Discovered)
  */
 function formatSetupFormingMessage(setup) {
     const symbol = setup.symbol || 'XRPUSD';
     const side = String(setup.direction || setup.side || 'BUY').toUpperCase();
     const isLong = side === 'BUY' || side === 'LONG';
-    const directionEmoji = isLong ? '🟢 LONG' : '🔴 SHORT';
+    const directionEmoji = isLong ? '🟢 LONG (Demand Setup)' : '🔴 SHORT (Supply Setup)';
     const directionPlain = isLong ? 'LONG' : 'SHORT';
 
     const entry = setup.entry_price || setup.entryLimit || setup.entry || 'N/A';
@@ -45,7 +134,7 @@ function formatSetupFormingMessage(setup) {
     const tp = setup.take_profit || setup.tp || 'N/A';
     const currentPrice = setup.currentPrice || setup.livePrice || 'N/A';
     const distPct = setup.distancePct !== undefined ? setup.distancePct : (setup.distPct || '');
-    const statusText = isLong ? '⏳ Waiting for Pullback to Demand' : '⏳ Waiting for Rally to Supply';
+    const statusText = isLong ? '⏳ Fresh Demand Zone • Waiting for Pullback' : '⏳ Fresh Supply Zone • Waiting for Rally';
 
     const now = new Date();
     const timeIst = now.toLocaleString('en-IN', { 
@@ -60,7 +149,7 @@ function formatSetupFormingMessage(setup) {
     }) + ' IST';
 
     const message = 
-`🟡 *Delta Setup Alert: Setup Forming*
+`🟡 *Delta Setup Alert: Setup Formed*
 
 • Asset: *${symbol}*
 • Direction: *${directionEmoji}*
@@ -68,7 +157,7 @@ function formatSetupFormingMessage(setup) {
 • Planned Entry: *$${entry}*
 • Planned Stop Loss: *$${sl}*
 • Planned Take Profit: *$${tp}*
-• Target RRR: *1:3*
+• Target RRR: *1:3* (Range: 1:2 to 1:4)
 • Current Price: *$${currentPrice}* (${distPct}% to zone)
 • Setup Time: *${timeIst}*`;
 
@@ -87,52 +176,63 @@ function formatSetupFormingMessage(setup) {
 }
 
 /**
- * Send WhatsApp Pre-Trade Reminder when a setup is forming
+ * Format Stage 2: Approaching Entry Zone (1-2 Min Warning)
  */
-async function sendWhatsAppSetupFormingAlert(setupData) {
-    const symbol = setupData.symbol || 'XRPUSD';
-    const entry = setupData.entry_price || setupData.entryLimit || setupData.entry || 'N/A';
-    const sl = setupData.stop_loss || setupData.sl || 'N/A';
-    const side = (setupData.direction || setupData.side || 'BUY').toUpperCase();
+function formatApproachingZoneMessage(setup) {
+    const symbol = setup.symbol || 'XRPUSD';
+    const side = String(setup.direction || setup.side || 'BUY').toUpperCase();
+    const isLong = side === 'BUY' || side === 'LONG';
+    const directionEmoji = isLong ? '🟢 LONG (Demand Retest)' : '🔴 SHORT (Supply Retest)';
+    const directionPlain = isLong ? 'LONG' : 'SHORT';
 
-    // Unique signature per setup zone
-    const signature = `${symbol}_${side}_${entry}_${sl}`;
-    const lastSent = sentSetupSignatures.get(signature);
-    const now = Date.now();
+    const entry = setup.entry_price || setup.entryLimit || setup.entry || 'N/A';
+    const sl = setup.stop_loss || setup.sl || 'N/A';
+    const tp = setup.take_profit || setup.tp || 'N/A';
+    const currentPrice = setup.currentPrice || setup.livePrice || 'N/A';
+    const distPct = setup.distancePct !== undefined ? setup.distancePct : (setup.distPct || '');
 
-    // Deduplicate: Don't re-send the exact same forming setup within 2 hours
-    if (lastSent && (now - lastSent) < (2 * 60 * 60 * 1000)) {
-        return { skipped: true, reason: 'Already notified for this setup zone' };
-    }
+    const now = new Date();
+    const timeIst = now.toLocaleString('en-IN', { 
+        timeZone: 'Asia/Kolkata', 
+        day: '2-digit', 
+        month: 'short', 
+        year: 'numeric',
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit',
+        hour12: true 
+    }) + ' IST';
 
-    sentSetupSignatures.set(signature, now);
+    const message = 
+`⚡ *Delta Pre-Trade Reminder: Approaching Entry Zone*
+⏱️ *Warning: ~1-2 Minutes to Zone Tap*
 
-    const formatted = formatSetupFormingMessage(setupData);
-    const results = [];
+• Asset: *${symbol}*
+• Direction: *${directionEmoji}*
+• Planned Entry: *$${entry}*
+• Planned Stop Loss: *$${sl}*
+• Planned Take Profit: *$${tp}*
+• Target RRR: *1:3* (Range: 1:2 to 1:4)
+• Current Price: *$${currentPrice}* (*${distPct}% from entry*)
+• Action: *Price is within 1% of entry zone. Prepare for execution or place resting limit order.*
+• Alert Time: *${timeIst}*`;
 
-    console.log(`\n[WhatsApp Notifier] ══════════════════════════════════════════`);
-    console.log(`[WhatsApp Notifier] 🟡 Pre-Trade Reminder: Setup Forming on ${formatted.symbol}...`);
-
-    for (const r of DEFAULT_RECIPIENTS) {
-        const jid = `${r.clean}@s.whatsapp.net`;
-        if (isConnected && waSocket) {
-            try {
-                await waSocket.sendMessage(jid, { text: formatted.text });
-                console.log(`[WhatsApp Notifier] ✅ Delivered setup reminder to ${r.phone}`);
-                results.push({ phone: r.phone, success: true });
-            } catch(e) {
-                console.error(`[WhatsApp Notifier] ❌ Failed setup reminder to ${r.phone}:`, e.message);
-                results.push({ phone: r.phone, success: false, error: e.message });
-            }
-        }
-    }
-    console.log(`[WhatsApp Notifier] ══════════════════════════════════════════\n`);
-
-    return { success: true, formatted_message: formatted.text, results };
+    return {
+        text: message,
+        symbol,
+        direction: directionPlain,
+        directionEmoji,
+        entry,
+        sl,
+        tp,
+        currentPrice,
+        distPct,
+        timeIst
+    };
 }
 
 /**
- * Format clean, simple trade alert message with simple icons
+ * Format Stage 3: Setup Retest Confirmed & Executed
  */
 function formatTradeAlertMessage(trade) {
     const symbol = trade.symbol || 'XRPUSD';
@@ -149,7 +249,6 @@ function formatTradeAlertMessage(trade) {
     const orderType = (trade.order_type || trade.orderType || 'Market');
     const orderId = trade.order_id || trade.orderId || 'DELTA_LIVE';
     
-    // Exact Trade Entry Execution Time in Indian Standard Time (IST)
     let entryDate = new Date();
     const rawTime = trade.entry_time || trade.entryTime || trade.timestamp || trade.created_at || trade.time;
     if (rawTime) {
@@ -171,14 +270,14 @@ function formatTradeAlertMessage(trade) {
     }) + ' IST';
 
     const message = 
-`🔔 *Delta Trade Alert: Trade Executed*
+`🔔 *Delta Trade Alert: Retest Confirmed & Executed*
 
 • Asset: *${symbol}*
 • Direction: *${directionEmoji}*
 • Entry: *$${entry}*
 • Stop Loss: *$${sl}*
 • Take Profit: *$${tp}*
-• Target RRR: *${rrr}*
+• Target RRR: *${rrr}* (Range: 1:2 to 1:4)
 • Capital Risk: *${capitalRiskPct}*
 • Order Type: *${orderType}*
 • Order ID: *#${orderId}*
@@ -197,6 +296,120 @@ function formatTradeAlertMessage(trade) {
         orderType,
         orderId,
         entryTimeIst
+    };
+}
+
+/**
+ * Send Stage 1 Alert: Setup Formed (Waiting for Retest)
+ */
+async function sendWhatsAppSetupFormingAlert(setupData) {
+    const symbol = setupData.symbol || 'XRPUSD';
+    const entry = setupData.entry_price || setupData.entryLimit || setupData.entry || 'N/A';
+    const sl = setupData.stop_loss || setupData.sl || 'N/A';
+    const side = (setupData.direction || setupData.side || 'BUY').toUpperCase();
+
+    const signature = `${symbol}_${side}_${entry}_${sl}_FORMED`;
+    const lastSent = sentSignatures.get(signature);
+    const now = Date.now();
+
+    // Deduplicate: Don't re-send the same setup formed alert within 1 hour
+    if (lastSent && (now - lastSent) < (60 * 60 * 1000)) {
+        return { skipped: true, reason: 'Setup formed alert already delivered' };
+    }
+    sentSignatures.set(signature, now);
+
+    const formatted = formatSetupFormingMessage(setupData);
+    console.log(`\n[WhatsApp Notifier] ══════════════════════════════════════════`);
+    console.log(`[WhatsApp Notifier] 🟡 Stage 1 Alert: Setup Formed on ${formatted.symbol}...`);
+
+    const results = [];
+    for (const r of DEFAULT_RECIPIENTS) {
+        const res = await sendOrQueueMessage(r, formatted.text, 'Stage 1 Setup Formed Alert');
+        results.push(res);
+    }
+    console.log(`[WhatsApp Notifier] ══════════════════════════════════════════\n`);
+
+    return { success: true, formatted_message: formatted.text, results };
+}
+
+/**
+ * Send Stage 2 Alert: Approaching Entry Zone (1-2 Min Warning)
+ */
+async function sendWhatsAppApproachingZoneAlert(setupData) {
+    const symbol = setupData.symbol || 'XRPUSD';
+    const entry = setupData.entry_price || setupData.entryLimit || setupData.entry || 'N/A';
+    const sl = setupData.stop_loss || setupData.sl || 'N/A';
+    const side = (setupData.direction || setupData.side || 'BUY').toUpperCase();
+
+    const signature = `${symbol}_${side}_${entry}_${sl}_APPROACHING`;
+    const lastSent = sentSignatures.get(signature);
+    const now = Date.now();
+
+    // Deduplicate: Don't re-send approaching reminder within 30 minutes for the same zone
+    if (lastSent && (now - lastSent) < (30 * 60 * 1000)) {
+        return { skipped: true, reason: 'Approaching zone alert already delivered' };
+    }
+    sentSignatures.set(signature, now);
+
+    const formatted = formatApproachingZoneMessage(setupData);
+    console.log(`\n[WhatsApp Notifier] ══════════════════════════════════════════`);
+    console.log(`[WhatsApp Notifier] ⚡ Stage 2 Alert: Approaching Zone (1-2 Min) on ${formatted.symbol}...`);
+
+    const results = [];
+    for (const r of DEFAULT_RECIPIENTS) {
+        const res = await sendOrQueueMessage(r, formatted.text, 'Stage 2 Approaching Zone Alert');
+        results.push(res);
+    }
+    console.log(`[WhatsApp Notifier] ══════════════════════════════════════════\n`);
+
+    return { success: true, formatted_message: formatted.text, results };
+}
+
+/**
+ * Send Stage 3 Alert: Trade Executed / Retest Confirmed
+ */
+async function sendWhatsAppTradeAlert(tradeData, config = {}) {
+    const formatted = formatTradeAlertMessage(tradeData);
+    const symbol = tradeData.symbol || 'XRPUSD';
+    const entry = tradeData.entry_price || tradeData.entryPrice || tradeData.entry || 'N/A';
+    const sl = tradeData.stop_loss || tradeData.stopLoss || tradeData.sl || 'N/A';
+    const side = (tradeData.direction || tradeData.side || 'BUY').toUpperCase();
+
+    const signature = `${symbol}_${side}_${entry}_${sl}_EXECUTED`;
+    const lastSent = sentSignatures.get(signature);
+    const now = Date.now();
+
+    // Deduplicate duplicate triggers within 15 minutes
+    if (lastSent && (now - lastSent) < (15 * 60 * 1000)) {
+        return { skipped: true, reason: 'Executed alert already delivered' };
+    }
+    sentSignatures.set(signature, now);
+
+    console.log(`\n[WhatsApp Notifier] ══════════════════════════════════════════`);
+    console.log(`[WhatsApp Notifier] 🔔 Stage 3 Alert: Trade Retest Confirmed for ${formatted.symbol}...`);
+
+    const results = [];
+    for (const r of DEFAULT_RECIPIENTS) {
+        const res = await sendOrQueueMessage(r, formatted.text, 'Stage 3 Trade Executed Alert');
+        results.push(res);
+    }
+
+    const logEntry = {
+        id: 'wa_' + Date.now(),
+        timestamp: new Date().toISOString(),
+        trade: formatted,
+        results: results
+    };
+    alertHistory.unshift(logEntry);
+    if (alertHistory.length > 50) alertHistory.pop();
+
+    console.log(`[WhatsApp Notifier] ══════════════════════════════════════════\n`);
+
+    return {
+        success: results.some(r => r.success),
+        is_connected: isConnected,
+        formatted_message: formatted.text,
+        recipients: results
     };
 }
 
@@ -265,6 +478,11 @@ async function initWhatsApp() {
                 connectionStatusText = `Connected as +${connectedUser}`;
                 console.log(`\n[WhatsApp] ✅ CONNECTED SUCCESSFULLY! Linked to WhatsApp account +${connectedUser}`);
                 console.log(`[WhatsApp] 🚀 Automatic Trade Alerts are ACTIVE for 8855964895 and 9022713613.\n`);
+
+                // Instantly flush any waiting queued alerts upon connection
+                flushOutboundQueue().catch(err => {
+                    console.error('[WhatsApp] Initial queue flush error:', err.message);
+                });
             }
         });
 
@@ -273,68 +491,6 @@ async function initWhatsApp() {
         connectionStatusText = 'Error initializing: ' + err.message;
         setTimeout(initWhatsApp, 10000);
     }
-}
-
-/**
- * Send WhatsApp trade alert to all recipients
- */
-async function sendWhatsAppTradeAlert(tradeData, config = {}) {
-    const formatted = formatTradeAlertMessage(tradeData);
-    const results = [];
-
-    console.log(`\n[WhatsApp Notifier] ══════════════════════════════════════════`);
-    console.log(`[WhatsApp Notifier] Sending alert for ${formatted.symbol} (${formatted.direction})...`);
-
-    const recipients = DEFAULT_RECIPIENTS;
-
-    for (const r of recipients) {
-        const jid = `${r.clean}@s.whatsapp.net`;
-        const waLink = `https://api.whatsapp.com/send?phone=${r.clean}&text=${encodeURIComponent(formatted.text)}`;
-        let success = false;
-        let statusMessage = '';
-
-        if (isConnected && waSocket) {
-            try {
-                await waSocket.sendMessage(jid, { text: formatted.text });
-                success = true;
-                statusMessage = `✅ Delivered to ${r.name} (${r.phone}) via Linked Device`;
-                console.log(`[WhatsApp Notifier] ✅ Sent to ${r.phone}`);
-            } catch(sendErr) {
-                statusMessage = `Send error: ${sendErr.message}`;
-                console.error(`[WhatsApp Notifier] ❌ Failed to send to ${r.phone}:`, sendErr.message);
-            }
-        } else {
-            statusMessage = `⚠️ WhatsApp not linked yet. Scan QR code on dashboard to enable automatic delivery.`;
-            console.log(`[WhatsApp Notifier] ⚠️ WhatsApp not linked yet. (Preview: ${waLink})`);
-        }
-
-        results.push({
-            phone: r.phone,
-            clean: r.clean,
-            name: r.name,
-            success: success,
-            status: statusMessage,
-            wa_link: waLink
-        });
-    }
-
-    const logEntry = {
-        id: 'wa_' + Date.now(),
-        timestamp: new Date().toISOString(),
-        trade: formatted,
-        results: results
-    };
-    alertHistory.unshift(logEntry);
-    if (alertHistory.length > 50) alertHistory.pop();
-
-    console.log(`[WhatsApp Notifier] ══════════════════════════════════════════\n`);
-
-    return {
-        success: results.some(r => r.success),
-        is_connected: isConnected,
-        formatted_message: formatted.text,
-        recipients: results
-    };
 }
 
 /**
@@ -364,7 +520,8 @@ function getWhatsAppStatus() {
         status_text: connectionStatusText,
         qr_code: latestQRDataUrl,
         recipients: DEFAULT_RECIPIENTS,
-        recent_alerts: alertHistory.slice(0, 5)
+        recent_alerts: alertHistory.slice(0, 5),
+        queued_count: outboundQueue.length
     };
 }
 
@@ -372,9 +529,12 @@ module.exports = {
     initWhatsApp,
     sendWhatsAppTradeAlert,
     sendWhatsAppSetupFormingAlert,
+    sendWhatsAppApproachingZoneAlert,
     sendTestWhatsAppAlert,
     getWhatsAppStatus,
+    flushOutboundQueue,
     formatTradeAlertMessage,
     formatSetupFormingMessage,
+    formatApproachingZoneMessage,
     DEFAULT_RECIPIENTS
 };

@@ -18,10 +18,14 @@ const {
     handleTradeSignal, 
     loadConfig, 
     fetchDeltaBalance, 
-    getProductId,
+    getProductId, 
     getContractMultiplier 
 } = require('./delta_bridge');
-const { sendWhatsAppSetupFormingAlert } = require('./modules/whatsapp_notifier');
+const { 
+    sendWhatsAppSetupFormingAlert, 
+    sendWhatsAppApproachingZoneAlert, 
+    sendWhatsAppTradeAlert 
+} = require('./modules/whatsapp_notifier');
 
 class StrategyScanner {
     constructor(options = {}) {
@@ -163,21 +167,26 @@ class StrategyScanner {
                 const sl = parseFloat((base.low - (base.low * 0.0008)).toFixed(4));
                 const entry = parseFloat(Math.max(base.open, base.close).toFixed(4));
                 const risk = Math.abs(entry - sl);
-                const tp = parseFloat((entry + (risk * 3)).toFixed(4));
+                const riskPct = (risk / entry) * 100;
 
-                detectedZones.push({
-                    type: 'DEMAND',
-                    side: 'BUY',
-                    top: Math.max(base.open, base.close),
-                    bottom: base.low,
-                    sl: sl,
-                    entryLimit: entry,
-                    tp: tp,
-                    riskDist: parseFloat(risk.toFixed(4)),
-                    rewardDist: parseFloat((risk * 3).toFixed(4)),
-                    time: base.time,
-                    mitigated: false
-                });
+                // Institutional Risk Guard: Discard zones where SL distance is oversized (> 2.0% or > 2.2x ATR)
+                if (riskPct <= 2.0 && risk <= atr * 2.2) {
+                    const tp = parseFloat((entry + (risk * 3)).toFixed(4));
+
+                    detectedZones.push({
+                        type: 'DEMAND',
+                        side: 'BUY',
+                        top: Math.max(base.open, base.close),
+                        bottom: base.low,
+                        sl: sl,
+                        entryLimit: entry,
+                        tp: tp,
+                        riskDist: parseFloat(risk.toFixed(4)),
+                        rewardDist: parseFloat((risk * 3).toFixed(4)),
+                        time: base.time,
+                        mitigated: false
+                    });
+                }
             }
 
             // Supply Zone (Bearish base before explosive plunge)
@@ -185,21 +194,26 @@ class StrategyScanner {
                 const sl = parseFloat((base.high + (base.high * 0.0008)).toFixed(4));
                 const entry = parseFloat(Math.min(base.open, base.close).toFixed(4));
                 const risk = Math.abs(sl - entry);
-                const tp = parseFloat((entry - (risk * 3)).toFixed(4));
+                const riskPct = (risk / entry) * 100;
 
-                detectedZones.push({
-                    type: 'SUPPLY',
-                    side: 'SELL',
-                    top: base.high,
-                    bottom: Math.min(base.open, base.close),
-                    sl: sl,
-                    entryLimit: entry,
-                    tp: tp,
-                    riskDist: parseFloat(risk.toFixed(4)),
-                    rewardDist: parseFloat((risk * 3).toFixed(4)),
-                    time: base.time,
-                    mitigated: false
-                });
+                // Institutional Risk Guard: Discard zones where SL distance is oversized (> 2.0% or > 2.2x ATR)
+                if (riskPct <= 2.0 && risk <= atr * 2.2) {
+                    const tp = parseFloat((entry - (risk * 3)).toFixed(4));
+
+                    detectedZones.push({
+                        type: 'SUPPLY',
+                        side: 'SELL',
+                        top: base.high,
+                        bottom: Math.min(base.open, base.close),
+                        sl: sl,
+                        entryLimit: entry,
+                        tp: tp,
+                        riskDist: parseFloat(risk.toFixed(4)),
+                        rewardDist: parseFloat((risk * 3).toFixed(4)),
+                        time: base.time,
+                        mitigated: false
+                    });
+                }
             }
         }
 
@@ -332,23 +346,64 @@ class StrategyScanner {
 
             if (analysis.setupStatus === 'READY_FOR_EXECUTION') {
                 this.logMessage(`🔥 [SIGNAL TRIGGERED] Retest confirmed at ${analysis.targetZone.type} $${analysis.targetZone.entryLimit}! Auto-executing...`);
-                await this.executeStrategySignal(analysis.targetZone, analysis.candleClose);
-            } else if (analysis.targetZone) {
-                this.logMessage(`[TARGET] ${analysis.targetZone.type}: $${analysis.targetZone.entryLimit} (SL: $${analysis.targetZone.sl} | TP: $${analysis.targetZone.tp}) | Distance: ${analysis.targetZone.distancePct}%`);
-                // Automatic Pre-Trade Reminder on WhatsApp (Setup Forming)
+                
+                // Stage 3 WhatsApp Alert: Setup Retest Confirmed & Active Execution
                 try {
-                    await sendWhatsAppSetupFormingAlert({
+                    await sendWhatsAppTradeAlert({
                         symbol: this.symbol,
                         side: analysis.targetZone.side,
                         direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
-                        entry: analysis.targetZone.entryLimit,
-                        sl: analysis.targetZone.sl,
-                        tp: analysis.targetZone.tp,
-                        livePrice: analysis.livePrice,
-                        distancePct: analysis.targetZone.distancePct
+                        entry_price: analysis.candleClose,
+                        stop_loss: analysis.targetZone.sl,
+                        take_profit: analysis.targetZone.tp,
+                        rrr: '1:3',
+                        capital_risk_percent: '5.0%',
+                        order_type: 'Market (Zone Retest Confirmed)',
+                        order_id: 'EXEC_' + Date.now().toString().slice(-6),
+                        entry_time: new Date().toISOString()
                     });
                 } catch (waErr) {
-                    console.error('[Scanner] WhatsApp Setup Alert Error:', waErr.message);
+                    console.error('[Scanner] Stage 3 Retest Trigger Alert Error:', waErr.message);
+                }
+
+                await this.executeStrategySignal(analysis.targetZone, analysis.candleClose);
+            } else if (analysis.targetZone) {
+                const dist = analysis.targetZone.distancePct;
+                this.logMessage(`[TARGET] ${analysis.targetZone.type}: $${analysis.targetZone.entryLimit} (SL: $${analysis.targetZone.sl} | TP: $${analysis.targetZone.tp}) | Distance: ${dist}%`);
+
+                // Stage 2 vs Stage 1 Alert Routing:
+                // If price is within 1.0% of entry, send Stage 2 Pre-Trade Reminder (~1-2 min warning)
+                if (dist !== null && dist !== undefined && Math.abs(dist) <= 1.0) {
+                    try {
+                        await sendWhatsAppApproachingZoneAlert({
+                            symbol: this.symbol,
+                            side: analysis.targetZone.side,
+                            direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
+                            entry: analysis.targetZone.entryLimit,
+                            sl: analysis.targetZone.sl,
+                            tp: analysis.targetZone.tp,
+                            livePrice: analysis.livePrice,
+                            distancePct: dist
+                        });
+                    } catch (waErr) {
+                        console.error('[Scanner] WhatsApp Approaching Alert Error:', waErr.message);
+                    }
+                } else {
+                    // Stage 1: Setup Formed (Waiting for Pullback/Rally)
+                    try {
+                        await sendWhatsAppSetupFormingAlert({
+                            symbol: this.symbol,
+                            side: analysis.targetZone.side,
+                            direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
+                            entry: analysis.targetZone.entryLimit,
+                            sl: analysis.targetZone.sl,
+                            tp: analysis.targetZone.tp,
+                            livePrice: analysis.livePrice,
+                            distancePct: dist
+                        });
+                    } catch (waErr) {
+                        console.error('[Scanner] WhatsApp Setup Alert Error:', waErr.message);
+                    }
                 }
             } else {
                 this.logMessage(`[STATUS] No fresh unmitigated zones in immediate window. Standing by for next 15M candle.`);

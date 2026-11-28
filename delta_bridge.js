@@ -1775,7 +1775,7 @@ function startServer() {
                 <h4 style="font-size: 13px; color: #f59e0b; margin-bottom: 8px; font-weight: 600;">⚖️ Capital Risk Management (4% - 5%)</h4>
                 <div style="background: var(--bg-surface); padding: 10px 12px; border-radius: 6px; font-size: 12px; line-height: 1.6; color: var(--text-dim);">
                     <div>• Risk on Capital: <strong style="color: #f59e0b;">5.0% per trade</strong></div>
-                    <div>• Target RRR: <strong style="color: #34d399;">Minimum 1:2 RRR (No Upper Restriction • Default 1:3)</strong></div>
+                    <div>• Target RRR: <strong style="color: #34d399;">1:2 to 1:4 (Default 1:3 • Tight Risk Guard)</strong></div>
                     <div>• Daily Trade Limit: <strong style="color: #34d399;">Unlimited (No Limit)</strong></div>
                 </div>
             </div>
@@ -1843,7 +1843,7 @@ function startServer() {
                     <span class="badge-live">LIVE INSTITUTIONAL</span>
                     <span id="user-role-badge" style="font-size: 11px; padding: 2px 8px; border-radius: 4px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);">🛡️ 2FA + Master Password</span>
                 </div>
-                <small style="color: var(--text-muted); font-size: 12px;">24/7 Supply & Demand Flow Terminal • Min 1:2 RRR (No Upper Limit) • 5% Capital Risk Guard</small>
+                <small style="color: var(--text-muted); font-size: 12px;">24/7 Supply & Demand Flow Terminal • 1:2 to 1:4 RRR (Default 1:3) • 5% Capital Risk Guard</small>
             </div>
             <div class="header-meta">
                 <div class="pill-stat" id="pill-balance">
