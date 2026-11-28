@@ -232,7 +232,7 @@ function formatApproachingZoneMessage(setup) {
 }
 
 /**
- * Format Stage 3: Setup Retest Confirmed & Executed
+ * Format Stage 3: Setup Retest Confirmed & Executed (or Margin Warning)
  */
 function formatTradeAlertMessage(trade) {
     const symbol = trade.symbol || 'XRPUSD';
@@ -248,6 +248,18 @@ function formatTradeAlertMessage(trade) {
     const capitalRiskPct = trade.capital_risk_percent || '5%';
     const orderType = (trade.order_type || trade.orderType || 'Market');
     const orderId = trade.order_id || trade.orderId || 'DELTA_LIVE';
+
+    const isMarginIssue = trade.is_margin_warning || (trade.margin_status === 'INSUFFICIENT_MARGIN') || !!trade.margin_warning;
+    const header = isMarginIssue 
+        ? `⚠️ *Delta Trade Alert: Retest Confirmed (Margin Warning)*` 
+        : `🔔 *Delta Trade Alert: Retest Confirmed & Executed*`;
+    
+    const reqMarginStr = trade.required_margin ? `$${parseFloat(trade.required_margin).toFixed(2)}` : 'N/A';
+    const availBalStr = trade.available_balance !== undefined ? `$${parseFloat(trade.available_balance).toFixed(2)}` : 'N/A';
+
+    const statusLine = isMarginIssue
+        ? `• Status: *⚠️ Auto-Order Blocked: Insufficient Margin*\n• Required Margin: *${reqMarginStr}*\n• Available Balance: *${availBalStr}*\n• Action: *Deposit funds on Delta Exchange to auto-execute, or enter trade manually.*`
+        : `• Status: *🟢 Retest Confirmed & Order Placed on Delta India*\n• Order Type: *${orderType}*\n• Order ID: *#${orderId}*`;
     
     let entryDate = new Date();
     const rawTime = trade.entry_time || trade.entryTime || trade.timestamp || trade.created_at || trade.time;
@@ -270,7 +282,7 @@ function formatTradeAlertMessage(trade) {
     }) + ' IST';
 
     const message = 
-`🔔 *Delta Trade Alert: Retest Confirmed & Executed*
+`${header}
 
 • Asset: *${symbol}*
 • Direction: *${directionEmoji}*
@@ -279,8 +291,7 @@ function formatTradeAlertMessage(trade) {
 • Take Profit: *$${tp}*
 • Target RRR: *${rrr}* (Range: 1:2 to 1:4)
 • Capital Risk: *${capitalRiskPct}*
-• Order Type: *${orderType}*
-• Order ID: *#${orderId}*
+${statusLine}
 • Entry Time: *${entryTimeIst}*`;
 
     return {

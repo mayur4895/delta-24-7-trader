@@ -29,15 +29,19 @@ const {
 
 class StrategyScanner {
     constructor(options = {}) {
-        this.symbol = options.symbol || process.env.SCAN_SYMBOL || 'XRPUSD';
+        const rawSymbols = options.symbols || (options.symbol ? [options.symbol] : (process.env.SCAN_SYMBOLS ? process.env.SCAN_SYMBOLS.split(',') : ['BTCUSD', 'ETHUSD', 'XRPUSD', 'PAXGUSD']));
+        this.symbols = rawSymbols.map(s => s.trim().toUpperCase()).filter(s => s !== 'SOLUSD');
+        this.symbol = this.symbols[0] || 'BTCUSD';
         this.intervalMs = options.intervalMs || 60 * 1000; // Check every 60s for new candle
-        this.lastCheckedBarTime = 0;
         this.isRunning = false;
         this.timer = null;
         this.activeZones = [];
         this.logs = [];
+        this.symbolStatuses = new Map();
+        this.lastBarTimes = new Map();
         this.latestStatus = {
             running: false,
+            symbols: this.symbols,
             symbol: this.symbol,
             lastScanTime: null,
             lastBarTime: null,
@@ -47,7 +51,7 @@ class StrategyScanner {
             ema4h: null,
             targetZone: null,
             distancePct: null,
-            summary: 'Initializing scanner...'
+            summary: `24/7 Multi-Asset Scanner initialized for: ${this.symbols.join(', ')}`
         };
     }
 
@@ -56,7 +60,7 @@ class StrategyScanner {
         const line = `[${time}] ${msg}`;
         console.log(line);
         this.logs.unshift(line);
-        if (this.logs.length > 60) this.logs.pop();
+        if (this.logs.length > 80) this.logs.pop();
     }
 
     /**
@@ -308,122 +312,155 @@ class StrategyScanner {
     }
 
     /**
-     * Run a single scan on latest closed candles
+     * Run multi-asset scan across all configured watchlists (BTC, ETH, XRP, Gold)
      */
     async scanOnce() {
         const timestampStr = new Date().toISOString().replace('T', ' ').substring(0, 19);
-        try {
-            const analysis = await this.analyzeMarket(this.symbol);
-            if (analysis.error) {
-                this.logMessage(`[SCANNER] ${analysis.message}`);
-                return;
+        for (const sym of this.symbols) {
+            try {
+                await this.scanSingleSymbol(sym, timestampStr);
+                // 300ms pause between assets to protect against API rate limits
+                await new Promise(r => setTimeout(r, 300));
+            } catch (err) {
+                this.logMessage(`[SCANNER ERROR - ${sym}]: ${err.message}`);
+            }
+        }
+    }
+
+    /**
+     * Scan and evaluate an individual asset for institutional setups & auto-execution
+     */
+    async scanSingleSymbol(sym, timestampStr) {
+        const analysis = await this.analyzeMarket(sym);
+        if (analysis.error) {
+            this.logMessage(`[SCANNER - ${sym}] ${analysis.message}`);
+            return;
+        }
+
+        const lastBar = this.lastBarTimes.get(sym);
+        const isNewBar = analysis.candleTime !== lastBar;
+        this.lastBarTimes.set(sym, analysis.candleTime);
+
+        const statusObj = {
+            running: this.isRunning,
+            symbol: sym,
+            lastScanTime: timestampStr,
+            lastBarTime: analysis.candleTime,
+            candleClose: analysis.candleClose,
+            livePrice: analysis.livePrice,
+            trend: analysis.trend,
+            ema4h: analysis.ema4h,
+            setupBuilt: analysis.setupBuilt,
+            setupStatus: analysis.setupStatus,
+            setupStatusLabel: analysis.setupStatusLabel,
+            targetZone: analysis.targetZone,
+            distancePct: analysis.targetZone ? analysis.targetZone.distancePct : null,
+            distanceUsd: analysis.targetZone ? analysis.targetZone.distanceUsd : null,
+            summary: analysis.simpleExplanation
+        };
+        this.symbolStatuses.set(sym, statusObj);
+
+        // Keep latestStatus synced with active symbol or last scanned
+        if (sym === this.symbol || !this.latestStatus.symbol) {
+            this.latestStatus = statusObj;
+        }
+
+        if (isNewBar || analysis.setupStatus === 'READY_FOR_EXECUTION' || (analysis.targetZone && Math.abs(analysis.targetZone.distancePct) <= 1.0)) {
+            this.logMessage(`[SCAN - ${sym}] 15M: $${analysis.candleClose} | Live: $${analysis.livePrice} | Trend: ${analysis.trend === 'BULLISH' ? '🟢 BULLISH' : '🔴 BEARISH'}`);
+        }
+
+        if (analysis.setupStatus === 'READY_FOR_EXECUTION') {
+            this.logMessage(`🔥 [SIGNAL TRIGGERED - ${sym}] Retest confirmed at ${analysis.targetZone.type} $${analysis.targetZone.entryLimit}! Checking margin & executing...`);
+            
+            // Check live wallet balance and calculate required margin
+            const config = loadConfig();
+            const balRes = await fetchDeltaBalance(config);
+            const balance = balRes.success ? balRes.available_balance : 0.60;
+            const multiplier = getContractMultiplier(sym);
+            const notional = analysis.candleClose * multiplier;
+            const reqMargin = notional / 10; // 10x leverage
+            const isMarginIssue = (balance > 0 && reqMargin > balance);
+
+            // Stage 3 WhatsApp Alert: Setup Retest Confirmed (With Margin Warning if balance insufficient)
+            try {
+                await sendWhatsAppTradeAlert({
+                    symbol: sym,
+                    side: analysis.targetZone.side,
+                    direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
+                    entry_price: analysis.candleClose,
+                    stop_loss: analysis.targetZone.sl,
+                    take_profit: analysis.targetZone.tp,
+                    rrr: '1:3',
+                    capital_risk_percent: '5.0%',
+                    is_margin_warning: isMarginIssue,
+                    required_margin: reqMargin,
+                    available_balance: balance,
+                    order_type: 'Market (Zone Retest Confirmed)',
+                    order_id: isMarginIssue ? 'BLOCKED_MARGIN' : ('EXEC_' + Date.now().toString().slice(-6)),
+                    entry_time: new Date().toISOString()
+                });
+            } catch (waErr) {
+                console.error(`[Scanner - ${sym}] Stage 3 Retest Trigger Alert Error:`, waErr.message);
             }
 
-            if (analysis.candleTime === this.latestStatus.lastBarTime) {
-                this.latestStatus.livePrice = analysis.livePrice;
-                return;
+            if (!isMarginIssue) {
+                await this.executeStrategySignal(analysis.targetZone, analysis.candleClose, sym);
+            } else {
+                this.logMessage(`⚠️ [MARGIN WARNING - ${sym}] Auto-execution skipped: Required margin ($${reqMargin.toFixed(2)}) > Available balance ($${balance.toFixed(2)}). WhatsApp alert dispatched.`);
+            }
+        } else if (analysis.targetZone) {
+            const dist = analysis.targetZone.distancePct;
+            if (isNewBar || Math.abs(dist) <= 1.0) {
+                this.logMessage(`[TARGET - ${sym}] ${analysis.targetZone.type}: $${analysis.targetZone.entryLimit} (SL: $${analysis.targetZone.sl} | TP: $${analysis.targetZone.tp}) | Distance: ${dist}%`);
             }
 
-            this.latestStatus = {
-                running: this.isRunning,
-                symbol: this.symbol,
-                lastScanTime: timestampStr,
-                lastBarTime: analysis.candleTime,
-                candleClose: analysis.candleClose,
-                livePrice: analysis.livePrice,
-                trend: analysis.trend,
-                ema4h: analysis.ema4h,
-                setupBuilt: analysis.setupBuilt,
-                setupStatus: analysis.setupStatus,
-                setupStatusLabel: analysis.setupStatusLabel,
-                targetZone: analysis.targetZone,
-                distancePct: analysis.targetZone ? analysis.targetZone.distancePct : null,
-                distanceUsd: analysis.targetZone ? analysis.targetZone.distanceUsd : null,
-                summary: analysis.simpleExplanation
-            };
-
-            this.logMessage(`[SCAN] 15M Closed: $${analysis.candleClose} | Live: $${analysis.livePrice} | Trend: ${analysis.trend === 'BULLISH' ? '🟢 BULLISH' : '🔴 BEARISH'}`);
-
-            if (analysis.setupStatus === 'READY_FOR_EXECUTION') {
-                this.logMessage(`🔥 [SIGNAL TRIGGERED] Retest confirmed at ${analysis.targetZone.type} $${analysis.targetZone.entryLimit}! Auto-executing...`);
-                
-                // Stage 3 WhatsApp Alert: Setup Retest Confirmed & Active Execution
+            // Stage 2 vs Stage 1 Alert Routing:
+            if (dist !== null && dist !== undefined && Math.abs(dist) <= 1.0) {
                 try {
-                    await sendWhatsAppTradeAlert({
-                        symbol: this.symbol,
+                    await sendWhatsAppApproachingZoneAlert({
+                        symbol: sym,
                         side: analysis.targetZone.side,
                         direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
-                        entry_price: analysis.candleClose,
-                        stop_loss: analysis.targetZone.sl,
-                        take_profit: analysis.targetZone.tp,
-                        rrr: '1:3',
-                        capital_risk_percent: '5.0%',
-                        order_type: 'Market (Zone Retest Confirmed)',
-                        order_id: 'EXEC_' + Date.now().toString().slice(-6),
-                        entry_time: new Date().toISOString()
+                        entry: analysis.targetZone.entryLimit,
+                        sl: analysis.targetZone.sl,
+                        tp: analysis.targetZone.tp,
+                        livePrice: analysis.livePrice,
+                        distancePct: dist
                     });
                 } catch (waErr) {
-                    console.error('[Scanner] Stage 3 Retest Trigger Alert Error:', waErr.message);
-                }
-
-                await this.executeStrategySignal(analysis.targetZone, analysis.candleClose);
-            } else if (analysis.targetZone) {
-                const dist = analysis.targetZone.distancePct;
-                this.logMessage(`[TARGET] ${analysis.targetZone.type}: $${analysis.targetZone.entryLimit} (SL: $${analysis.targetZone.sl} | TP: $${analysis.targetZone.tp}) | Distance: ${dist}%`);
-
-                // Stage 2 vs Stage 1 Alert Routing:
-                // If price is within 1.0% of entry, send Stage 2 Pre-Trade Reminder (~1-2 min warning)
-                if (dist !== null && dist !== undefined && Math.abs(dist) <= 1.0) {
-                    try {
-                        await sendWhatsAppApproachingZoneAlert({
-                            symbol: this.symbol,
-                            side: analysis.targetZone.side,
-                            direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
-                            entry: analysis.targetZone.entryLimit,
-                            sl: analysis.targetZone.sl,
-                            tp: analysis.targetZone.tp,
-                            livePrice: analysis.livePrice,
-                            distancePct: dist
-                        });
-                    } catch (waErr) {
-                        console.error('[Scanner] WhatsApp Approaching Alert Error:', waErr.message);
-                    }
-                } else {
-                    // Stage 1: Setup Formed (Waiting for Pullback/Rally)
-                    try {
-                        await sendWhatsAppSetupFormingAlert({
-                            symbol: this.symbol,
-                            side: analysis.targetZone.side,
-                            direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
-                            entry: analysis.targetZone.entryLimit,
-                            sl: analysis.targetZone.sl,
-                            tp: analysis.targetZone.tp,
-                            livePrice: analysis.livePrice,
-                            distancePct: dist
-                        });
-                    } catch (waErr) {
-                        console.error('[Scanner] WhatsApp Setup Alert Error:', waErr.message);
-                    }
+                    console.error(`[Scanner - ${sym}] WhatsApp Approaching Alert Error:`, waErr.message);
                 }
             } else {
-                this.logMessage(`[STATUS] No fresh unmitigated zones in immediate window. Standing by for next 15M candle.`);
+                // Stage 1: Setup Formed (Waiting for Pullback/Rally)
+                try {
+                    await sendWhatsAppSetupFormingAlert({
+                        symbol: sym,
+                        side: analysis.targetZone.side,
+                        direction: analysis.targetZone.side === 'BUY' ? 'LONG' : 'SHORT',
+                        entry: analysis.targetZone.entryLimit,
+                        sl: analysis.targetZone.sl,
+                        tp: analysis.targetZone.tp,
+                        livePrice: analysis.livePrice,
+                        distancePct: dist
+                    });
+                } catch (waErr) {
+                    console.error(`[Scanner - ${sym}] WhatsApp Setup Alert Error:`, waErr.message);
+                }
             }
-
-        } catch (err) {
-            this.logMessage(`[SCANNER ERROR]: ${err.message}`);
         }
     }
 
     /**
      * Dispatch trade signal to delta_bridge execution pipeline
      */
-    async executeStrategySignal(zone, entryPrice) {
+    async executeStrategySignal(zone, entryPrice, targetSymbol = this.symbol) {
+        const sym = (targetSymbol || this.symbol).toUpperCase();
         const config = loadConfig();
         const balRes = await fetchDeltaBalance(config);
         const balance = balRes.success ? balRes.available_balance : 0.60;
 
         const payload = {
-            symbol: this.symbol,
+            symbol: sym,
             side: zone.side,
             entry_price: entryPrice,
             stop_loss: zone.sl,
@@ -435,20 +472,29 @@ class StrategyScanner {
             order_type: 'market'
         };
 
-        this.logMessage(`[DISPATCHING TO DELTA INDIA] ${zone.side} ${this.symbol} @ $${entryPrice} (SL: $${zone.sl} | TP: $${zone.tp})`);
+        this.logMessage(`[DISPATCHING TO DELTA INDIA] ${zone.side} ${sym} @ $${entryPrice} (SL: $${zone.sl} | TP: $${zone.tp})`);
         const result = await handleTradeSignal(payload);
-        this.logMessage(`[EXECUTION RESULT]: Verdict=${result.verdict} | RejectReason=${result.reject_reason || 'NONE'}`);
+        this.logMessage(`[EXECUTION RESULT - ${sym}]: Verdict=${result.verdict} | RejectReason=${result.reject_reason || 'NONE'}`);
         this.latestStatus.lastSignal = {
             time: new Date().toISOString(),
+            symbol: sym,
             zone: zone,
             result: result
         };
     }
 
-    getStatus() {
+    getStatus(symbol) {
+        let baseStatus = this.latestStatus;
+        if (symbol) {
+            const clean = symbol.toUpperCase().replace('XAUUSD', 'PAXGUSD').replace('GOLD', 'PAXGUSD');
+            if (this.symbolStatuses.has(clean)) {
+                baseStatus = this.symbolStatuses.get(clean);
+            }
+        }
         return {
-            ...this.latestStatus,
-            logs: this.logs.slice(0, 25)
+            ...baseStatus,
+            symbols: this.symbols,
+            logs: this.logs.slice(0, 30)
         };
     }
 
@@ -456,7 +502,7 @@ class StrategyScanner {
         if (this.isRunning) return;
         this.isRunning = true;
         this.latestStatus.running = true;
-        this.logMessage(`🚀 [24/7 DELTA STRATEGY SCANNER STARTED] Monitoring ${this.symbol} on 15M`);
+        this.logMessage(`🚀 [24/7 MULTI-ASSET SCANNER STARTED] Monitoring: ${this.symbols.join(', ')} on 15M`);
         this.logMessage(`Checking candle closes every ${this.intervalMs / 1000}s...`);
 
         this.scanOnce();

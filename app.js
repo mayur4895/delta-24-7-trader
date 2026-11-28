@@ -16,21 +16,23 @@ console.log('=============================================================\n');
 
 // 1. Load system configuration
 const config = loadConfig();
-const symbol = process.env.SCAN_SYMBOL || 'XRPUSD';
+const rawSymbols = process.env.SCAN_SYMBOLS ? process.env.SCAN_SYMBOLS.split(',') : ['BTCUSD', 'ETHUSD', 'XRPUSD', 'PAXGUSD'];
+const symbols = rawSymbols.map(s => s.trim().toUpperCase()).filter(s => s !== 'SOLUSD');
 const scanIntervalSeconds = parseInt(process.env.SCAN_INTERVAL_SECONDS || '60', 10);
 
 console.log(`[INIT] Environment: ${config.delta.environment.toUpperCase()}`);
-console.log(`[INIT] Target Symbol: ${symbol} (15-Minute Candles)`);
-console.log(`[INIT] Scan Frequency: Every ${scanIntervalSeconds} seconds`);
+console.log(`[INIT] Multi-Asset Watchlist: ${symbols.join(', ')} (15-Minute Candles)`);
+console.log(`[INIT] Scan Frequency: Every ${scanIntervalSeconds} seconds across all assets`);
 console.log(`[INIT] Daily Trades: Unlimited (No Limit)`);
-console.log(`[INIT] Adaptive Leverage: Active (Auto-sizes for ₹51 / $0.60+ capital)\n`);
+console.log(`[INIT] Multi-Stage WhatsApp Pre-Alerts: Active (Formed, Approaching 1-2 min, Retest Confirmed)`);
+console.log(`[INIT] Adaptive Leverage & Margin Guard: Active\n`);
 
 // 2. Start HTTP Webhook & Dashboard Server
 const server = startServer();
 
-// 3. Initialize & Start 24/7 Candle Scanner
+// 3. Initialize & Start 24/7 Multi-Asset Candle Scanner
 const scanner = new StrategyScanner({
-    symbol: symbol,
+    symbols: symbols,
     intervalMs: scanIntervalSeconds * 1000
 });
 

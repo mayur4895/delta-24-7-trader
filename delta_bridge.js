@@ -1873,7 +1873,6 @@ function startServer() {
             <button class="tab-btn" onclick="selectSymbol('XRPUSD', this)">Ripple (XRPUSD)</button>
             <button class="tab-btn" onclick="selectSymbol('BTCUSD', this)">Bitcoin (BTCUSD)</button>
             <button class="tab-btn" onclick="selectSymbol('ETHUSD', this)">Ethereum (ETHUSD)</button>
-            <button class="tab-btn" onclick="selectSymbol('SOLUSD', this)">Solana (SOLUSD)</button>
         </div>
 
         <!-- Setup Diagnostics Card -->
