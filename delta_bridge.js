@@ -186,20 +186,49 @@ async function getProductId(host, symbol) {
     return 14969; // Default to XRPUSD
 }
 
-function calculateAdaptiveLeverage(notionalValue, accountBalance, requestedLeverage, maxLeverage = 100) {
-    const leverageSteps = [10, 15, 20, 25, 30, 40, 50, 75, 100];
-    let startIdx = leverageSteps.findIndex(l => l >= requestedLeverage);
+// Maximum supported leverage per asset on Delta Exchange India
+const maxExchangeLeverage = {
+    'BTCUSD': 100,
+    'ETHUSD': 100,
+    'XRPUSD': 50,
+    'PAXGUSD': 50,
+    'XAUUSD': 50,
+    'GOLD': 50
+};
+
+function calculateAdaptiveLeverage(notionalValue, accountBalance, requestedLeverage = 10, symbol = 'BTCUSD') {
+    const cleanSym = (symbol || 'BTCUSD').toUpperCase().replace('XAUUSD', 'PAXGUSD').replace('GOLD', 'PAXGUSD');
+    const exchangeLimit = maxExchangeLeverage[cleanSym] || 50;
+
+    // Rule 1: If 1 lot can fit without exceeding 50x leverage, max leverage is strictly 50x
+    const standardSteps = [10, 15, 20, 25, 30, 40, 50];
+    let startIdx = standardSteps.findIndex(l => l >= (requestedLeverage || 10));
     if (startIdx === -1) startIdx = 0;
 
-    for (let i = startIdx; i < leverageSteps.length; i++) {
-        const lev = leverageSteps[i];
-        if (lev > maxLeverage) break;
+    for (let i = startIdx; i < standardSteps.length; i++) {
+        const lev = standardSteps[i];
+        if (lev > exchangeLimit) break;
         const reqMargin = notionalValue / lev;
-        if (reqMargin <= (accountBalance * 0.45)) {
+        if (accountBalance > 0 && reqMargin <= (accountBalance * 0.90)) {
             return lev;
         }
     }
-    return Math.min(maxLeverage, 100);
+
+    // Rule 2: If 1 lot CANNOT fit within 50x (e.g. BTC with small balance),
+    // and higher leverage is available on Delta Exchange (e.g. 75x, 100x),
+    // take the higher leverage so 1 lot can execute
+    if (exchangeLimit > 50) {
+        const highSteps = [75, 100];
+        for (const lev of highSteps) {
+            if (lev > exchangeLimit) break;
+            const reqMargin = notionalValue / lev;
+            if (accountBalance > 0 && reqMargin <= accountBalance) {
+                return lev;
+            }
+        }
+    }
+
+    return Math.min(exchangeLimit, 100);
 }
 
 function setDeltaProductLeverage(host, productId, leverage, config) {
@@ -572,14 +601,14 @@ async function handleTradeSignal(signalData) {
     
     // Automatically calculate adaptive leverage if capital is low
     let adaptiveInfo = null;
-    if (clientBalance > 0 && (notionalValue / leverage) > (clientBalance * 0.45)) {
+    if (clientBalance > 0 && (notionalValue / leverage) > (clientBalance * 0.90)) {
         const originalLev = leverage;
-        leverage = calculateAdaptiveLeverage(notionalValue, clientBalance, originalLev, 100);
+        leverage = calculateAdaptiveLeverage(notionalValue, clientBalance, originalLev, signalData.symbol || 'BTCUSD');
         adaptiveInfo = {
             adjusted: true,
             original_leverage: `${originalLev}x`,
             adapted_leverage: `${leverage}x`,
-            reason: `Capital ($${clientBalance.toFixed(2)}) is low. Automatically increased leverage to ${leverage}x so required margin ($${(notionalValue / leverage).toFixed(2)}) safely fits available balance.`
+            reason: `Capital ($${clientBalance.toFixed(2)}) is low. Automatically adjusted leverage to ${leverage}x so required margin ($${(notionalValue / leverage).toFixed(2)}) safely fits available balance.`
         };
     }
 
@@ -2986,7 +3015,8 @@ module.exports = {
     fetchDeltaBalance,
     fetchDeltaPositions,
     fetchDeltaOrders,
-    cancelDeltaOrder
+    cancelDeltaOrder,
+    calculateAdaptiveLeverage
 };
 
 if (require.main === module) {

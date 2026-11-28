@@ -19,7 +19,8 @@ const {
     loadConfig, 
     fetchDeltaBalance, 
     getProductId, 
-    getContractMultiplier 
+    getContractMultiplier,
+    calculateAdaptiveLeverage 
 } = require('./delta_bridge');
 const { 
     sendWhatsAppSetupFormingAlert, 
@@ -378,7 +379,10 @@ class StrategyScanner {
             const balance = balRes.success ? balRes.available_balance : 0.60;
             const multiplier = getContractMultiplier(sym);
             const notional = analysis.candleClose * multiplier;
-            const reqMargin = notional / 10; // 10x leverage
+            
+            // Calculate dynamic adaptive leverage: max 50x if 1 lot fits, or up to 100x if higher leverage is needed & present (e.g. BTC)
+            const effectiveLeverage = calculateAdaptiveLeverage(notional, balance, 10, sym);
+            const reqMargin = notional / effectiveLeverage;
             const isMarginIssue = (balance > 0 && reqMargin > balance);
 
             // Stage 3 WhatsApp Alert: Setup Retest Confirmed (With Margin Warning if balance insufficient)
@@ -395,7 +399,7 @@ class StrategyScanner {
                     is_margin_warning: isMarginIssue,
                     required_margin: reqMargin,
                     available_balance: balance,
-                    order_type: 'Market (Zone Retest Confirmed)',
+                    order_type: `Market (${effectiveLeverage}x Adaptive Leverage)`,
                     order_id: isMarginIssue ? 'BLOCKED_MARGIN' : ('EXEC_' + Date.now().toString().slice(-6)),
                     entry_time: new Date().toISOString()
                 });
@@ -404,9 +408,9 @@ class StrategyScanner {
             }
 
             if (!isMarginIssue) {
-                await this.executeStrategySignal(analysis.targetZone, analysis.candleClose, sym);
+                await this.executeStrategySignal(analysis.targetZone, analysis.candleClose, sym, effectiveLeverage);
             } else {
-                this.logMessage(`⚠️ [MARGIN WARNING - ${sym}] Auto-execution skipped: Required margin ($${reqMargin.toFixed(2)}) > Available balance ($${balance.toFixed(2)}). WhatsApp alert dispatched.`);
+                this.logMessage(`⚠️ [MARGIN WARNING - ${sym}] Auto-execution skipped: Required margin ($${reqMargin.toFixed(2)} at ${effectiveLeverage}x) > Available balance ($${balance.toFixed(2)}). WhatsApp alert dispatched.`);
             }
         } else if (analysis.targetZone) {
             const dist = analysis.targetZone.distancePct;
@@ -453,7 +457,7 @@ class StrategyScanner {
     /**
      * Dispatch trade signal to delta_bridge execution pipeline
      */
-    async executeStrategySignal(zone, entryPrice, targetSymbol = this.symbol) {
+    async executeStrategySignal(zone, entryPrice, targetSymbol = this.symbol, customLeverage = 10) {
         const sym = (targetSymbol || this.symbol).toUpperCase();
         const config = loadConfig();
         const balRes = await fetchDeltaBalance(config);
@@ -467,12 +471,12 @@ class StrategyScanner {
             take_profit: zone.tp,
             rrr: 3,
             size: 1, // Auto-sized for margin safety
-            leverage: 10,
+            leverage: customLeverage || 10,
             account_balance: balance,
             order_type: 'market'
         };
 
-        this.logMessage(`[DISPATCHING TO DELTA INDIA] ${zone.side} ${sym} @ $${entryPrice} (SL: $${zone.sl} | TP: $${zone.tp})`);
+        this.logMessage(`[DISPATCHING TO DELTA INDIA] ${zone.side} ${sym} @ $${entryPrice} (${customLeverage}x Leverage | SL: $${zone.sl} | TP: $${zone.tp})`);
         const result = await handleTradeSignal(payload);
         this.logMessage(`[EXECUTION RESULT - ${sym}]: Verdict=${result.verdict} | RejectReason=${result.reject_reason || 'NONE'}`);
         this.latestStatus.lastSignal = {
